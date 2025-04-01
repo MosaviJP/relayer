@@ -136,6 +136,94 @@ func (s *Server) doEvent(ctx context.Context, ws *WebSocket, request []json.RawM
 	return ""
 }
 
+func (s *Server) doEvents(
+    ctx context.Context,
+    ws *WebSocket,
+    request []json.RawMessage,
+    store eventstore.Store,
+) string {
+    if len(request) < 2 {
+        ws.WriteJSON(nostr.OKEnvelope{
+            EventID: "",
+            OK:      false,
+            Reason:  "invalid request: missing events array",
+        })
+        return ""
+    }
+
+    var events []nostr.Event
+    if err := json.Unmarshal(request[1], &events); err != nil {
+        ws.WriteJSON(nostr.OKEnvelope{
+            EventID: "",
+            OK:      false,
+            Reason:  "failed to decode events array: " + err.Error(),
+        })
+        return ""
+    }
+
+    for _, evt := range events {
+        // 3.1 计算并验证 ID
+        hash := sha256.Sum256(evt.Serialize())
+        computedID := hex.EncodeToString(hash[:])
+        if computedID != evt.ID {
+            ws.WriteJSON(nostr.OKEnvelope{
+                EventID: "",
+                OK:      false,
+                Reason:  fmt.Sprintf("invalid event id for %s, computed=%s", evt.ID, computedID),
+            })
+            return ""
+        }
+
+        // 3.2 验签
+        sigOK, err := evt.CheckSignature()
+        if err != nil {
+            ws.WriteJSON(nostr.OKEnvelope{
+                EventID: evt.ID,
+                OK:      false,
+                Reason:  "failed to verify signature: " + err.Error(),
+            })
+            return ""
+        } else if !sigOK {
+            ws.WriteJSON(nostr.OKEnvelope{
+                EventID: evt.ID,
+                OK:      false,
+                Reason:  "invalid signature",
+            })
+            return ""
+        }
+
+        accept, why := s.relay.AcceptEvent(ctx, &evt)
+        if !accept {
+            ws.WriteJSON(nostr.OKEnvelope{
+                EventID: evt.ID,
+                OK:      false,
+                Reason:  "rejected by relay: " + why,
+            })
+            return ""
+        }
+    }
+
+    for _, evt := range events {
+        ok, reason := AddEvent(ctx, s.relay, &evt)
+        if !ok {
+            ws.WriteJSON(nostr.OKEnvelope{
+                EventID: evt.ID,
+                OK:      false,
+                Reason:  fmt.Sprintf("failed to add event: %s", reason),
+            })
+            return ""
+        }
+    }
+
+    ws.WriteJSON(nostr.OKEnvelope{
+        EventID: "",
+        OK:      true,
+        Reason:  "batch processed",
+    })
+
+    return ""
+}
+
 func (s *Server) doCount(ctx context.Context, ws *WebSocket, request []json.RawMessage, store eventstore.Store) string {
 	counter, ok := store.(EventCounter)
 	if !ok {
@@ -328,6 +416,8 @@ func (s *Server) handleMessage(ctx context.Context, ws *WebSocket, message []byt
 	switch typ {
 	case "EVENT":
 		notice = s.doEvent(ctx, ws, request, store)
+	case "EVENTS":
+		notice = s.doEvents(ctx, ws, request, store)
 	case "COUNT":
 		notice = s.doCount(ctx, ws, request, store)
 	case "REQ":
