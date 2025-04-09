@@ -15,7 +15,6 @@ import (
 	"github.com/nbd-wtf/go-nostr"
 	"github.com/nbd-wtf/go-nostr/nip11"
 	"github.com/nbd-wtf/go-nostr/nip42"
-	"golang.org/x/exp/slices"
 	"golang.org/x/time/rate"
 )
 
@@ -245,29 +244,6 @@ func (s *Server) doCount(ctx context.Context, ws *WebSocket, request []json.RawM
 
 		filter := filters[i]
 
-		// prevent kind-4 events from being returned to unauthed users,
-		//   only when authentication is a thing
-		if _, ok := s.relay.(Auther); ok {
-			if slices.Contains(filter.Kinds, 4) {
-				senders := filter.Authors
-				receivers, _ := filter.Tags["p"]
-				switch {
-				case ws.authed == "":
-					// not authenticated
-					return "restricted: this relay does not serve kind-4 to unauthenticated users, does your client implement NIP-42?"
-				case len(senders) == 1 && len(receivers) < 2 && (senders[0] == ws.authed):
-					// allowed filter: ws.authed is sole sender (filter specifies one or all receivers)
-				case len(receivers) == 1 && len(senders) < 2 && (receivers[0] == ws.authed):
-					// allowed filter: ws.authed is sole receiver (filter specifies one or all senders)
-				default:
-					// restricted filter: do not return any events,
-					//   even if other elements in filters array were not restricted).
-					//   client should know better.
-					return "restricted: authenticated user does not have authorization for requested filters."
-				}
-			}
-		}
-
 		count, err := counter.CountEvents(ctx, filter)
 		if err != nil {
 			s.Log.Errorf("store: %v", err)
@@ -307,26 +283,6 @@ func (s *Server) doReq(ctx context.Context, ws *WebSocket, request []json.RawMes
 
 		// prevent kind-4 events from being returned to unauthed users,
 		//   only when authentication is a thing
-		if _, ok := s.relay.(Auther); ok {
-			if slices.Contains(filter.Kinds, 4) {
-				senders := filter.Authors
-				receivers, _ := filter.Tags["p"]
-				switch {
-				case ws.authed == "":
-					// not authenticated
-					return "restricted: this relay does not serve kind-4 to unauthenticated users, does your client implement NIP-42?"
-				case len(senders) == 1 && len(receivers) < 2 && (senders[0] == ws.authed):
-					// allowed filter: ws.authed is sole sender (filter specifies one or all receivers)
-				case len(receivers) == 1 && len(senders) < 2 && (receivers[0] == ws.authed):
-					// allowed filter: ws.authed is sole receiver (filter specifies one or all senders)
-				default:
-					// restricted filter: do not return any events,
-					//   even if other elements in filters array were not restricted).
-					//   client should know better.
-					return "restricted: authenticated user does not have authorization for requested filters."
-				}
-			}
-		}
 
 		events, err := store.QueryEvents(ctx, filter)
 		if err != nil {
@@ -488,11 +444,6 @@ func (s *Server) HandleWebsocket(w http.ResponseWriter, r *http.Request) {
 			conn.SetReadDeadline(time.Now().Add(pongWait))
 			return nil
 		})
-
-		// NIP-42 auth challenge
-		if _, ok := s.relay.(Auther); ok {
-			ws.WriteJSON(nostr.AuthEnvelope{Challenge: &ws.challenge})
-		}
 
 		for {
 			typ, message, err := conn.ReadMessage()
