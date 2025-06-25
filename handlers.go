@@ -210,8 +210,9 @@ func (s *Server) doEvents(
                 OK:      false,
                 Reason:  fmt.Sprintf("failed to add event: %s", reason),
             })
-            return ""
-        }
+        } else {
+			ws.WriteJSON(nostr.OKEnvelope{EventID: evt.ID, OK: true})
+		}
     }
 
     ws.WriteJSON(nostr.OKEnvelope{
