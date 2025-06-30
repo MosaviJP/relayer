@@ -265,11 +265,21 @@ func (s *Server) doReq(ctx context.Context, ws *WebSocket, request []json.RawMes
 	}
 
 	filters := make(nostr.Filters, len(request)-2)
+	limitZeroFlags := make([]bool, len(filters))
+
 	for i, filterReq := range request[2:] {
-		if err := json.Unmarshal(
-			filterReq,
-			&filters[i],
-		); err != nil {
+		var raw map[string]json.RawMessage
+		if err := json.Unmarshal(filterReq, &raw); err != nil {
+			return "failed to decode filter"
+		}
+		if v, ok := raw["limit"]; ok {
+			var lim int
+			if err := json.Unmarshal(v, &lim); err == nil && lim == 0 {
+				limitZeroFlags[i] = true
+			}
+		}
+
+		if err := json.Unmarshal(filterReq, &filters[i]); err != nil {
 			return "failed to decode filter"
 		}
 	}
@@ -280,7 +290,10 @@ func (s *Server) doReq(ctx context.Context, ws *WebSocket, request []json.RawMes
 		}
 	}
 
-	for _, filter := range filters {
+	for idx, filter := range filters {
+		if limitZeroFlags[idx] {
+			continue
+		}
 
 		// prevent kind-4 events from being returned to unauthed users,
 		//   only when authentication is a thing
@@ -301,11 +314,11 @@ func (s *Server) doReq(ctx context.Context, ws *WebSocket, request []json.RawMes
 				if s.options.skipEventFunc != nil && s.options.skipEventFunc(event) {
 					continue
 				}
-				ws.WriteJSON(nostr.EventEnvelope{SubscriptionID: &id, Event: *event})
-				i++
-				if i > filter.Limit {
+				if i >= filter.Limit {
 					break
 				}
+				ws.WriteJSON(nostr.EventEnvelope{SubscriptionID: &id, Event: *event})
+				i++
 			}
 
 			// exhaust the channel (in case we broke out of it early) so it is closed by the storage
