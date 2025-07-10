@@ -8,6 +8,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"net/http"
+	"sync"
 	"time"
 
 	"github.com/fasthttp/websocket"
@@ -259,10 +260,6 @@ func (s *Server) doCount(ctx context.Context, ws *WebSocket, request []json.RawM
 
 func (s *Server) doReq(ctx context.Context, ws *WebSocket, request []json.RawMessage, store eventstore.Store) string {
 	startTime := time.Now()
-	var filterTimes []time.Duration
-	var dbQueryTimes []time.Duration
-	var eventCounts []int
-	totalEvents := 0
 	
 	var id string
 	json.Unmarshal(request[1], &id)
@@ -296,77 +293,117 @@ func (s *Server) doReq(ctx context.Context, ws *WebSocket, request []json.RawMes
 		}
 	}
 
+	// 并行查询结果结构
+	type filterResult struct {
+		idx         int
+		events      <-chan *nostr.Event
+		err         error
+		filterTime  time.Duration
+		dbQueryTime time.Duration
+		eventCount  int
+	}
+
+	// 启动并行查询
+	var wg sync.WaitGroup
+	results := make([]filterResult, len(filters))
+	
 	for idx, filter := range filters {
-		filterStart := time.Now()
-		eventCount := 0
-		
 		if limitZeroFlags[idx] {
-			filterTimes = append(filterTimes, time.Since(filterStart))
-			dbQueryTimes = append(dbQueryTimes, 0)
-			eventCounts = append(eventCounts, 0)
+			results[idx] = filterResult{
+				idx:         idx,
+				events:      nil,
+				err:         nil,
+				filterTime:  0,
+				dbQueryTime: 0,
+				eventCount:  0,
+			}
 			continue
 		}
 
-		// prevent kind-4 events from being returned to unauthed users,
-		//   only when authentication is a thing
+		wg.Add(1)
+		go func(idx int, filter nostr.Filter) {
+			defer wg.Done()
+			
+			dbStart := time.Now()
+			events, err := store.QueryEvents(ctx, filter)
+			dbDuration := time.Since(dbStart)
+			
+			results[idx] = filterResult{
+				idx:         idx,
+				events:      events,
+				err:         err,
+				filterTime:  0, // 将在处理完事件后设置
+				dbQueryTime: dbDuration,
+				eventCount:  0, // 将在处理事件时计算
+			}
+		}(idx, filter)
+	}
 
-		dbStart := time.Now()
-		events, err := store.QueryEvents(ctx, filter)
-		dbDuration := time.Since(dbStart)
-		dbQueryTimes = append(dbQueryTimes, dbDuration)
+	// 等待所有查询完成
+	wg.Wait()
+	
+	totalEvents := 0
+	totalDbTime := time.Duration(0)
+
+	// 按顺序处理结果，确保事件发送顺序
+	for idx, result := range results {
+		if limitZeroFlags[idx] {
+			continue
+		}
+
+		eventProcessStart := time.Now()
 		
-		if err != nil {
-			s.Log.Errorf("store: %v", err)
-			filterTimes = append(filterTimes, time.Since(filterStart))
-			eventCounts = append(eventCounts, 0)
+		if result.err != nil {
+			s.Log.Errorf("store: %v", result.err)
+			results[idx].filterTime = time.Since(eventProcessStart)
 			continue
 		}
 
-		// ensures the client won't be bombarded with events in case Storage doesn't do limits right
+		// 确保客户端不会被事件轰炸，以防 Storage 没有正确执行 limits
+		filter := filters[idx]
 		if filter.Limit == 0 {
 			filter.Limit = 9999999999
 		}
-		i := 0
-		if events != nil {
-			for event := range events {
+		
+		eventCount := 0
+		if result.events != nil {
+			for event := range result.events {
 				if s.options.skipEventFunc != nil && s.options.skipEventFunc(event) {
 					continue
 				}
-				if i >= filter.Limit {
+				if eventCount >= filter.Limit {
 					break
 				}
 				ws.WriteJSON(nostr.EventEnvelope{SubscriptionID: &id, Event: *event})
-				i++
 				eventCount++
 			}
 
-			// exhaust the channel (in case we broke out of it early) so it is closed by the storage
-			for range events {
+			// 耗尽 channel（以防我们提前跳出），这样存储层会关闭它
+			for range result.events {
 			}
 		}
 		
-		eventCounts = append(eventCounts, eventCount)
+		results[idx].eventCount = eventCount
+		results[idx].filterTime = time.Since(eventProcessStart) + result.dbQueryTime
 		totalEvents += eventCount
-		filterTimes = append(filterTimes, time.Since(filterStart))
+		totalDbTime += result.dbQueryTime
 	}
 
 	totalTime := time.Since(startTime)
 	
 	// 构建单行时间统计信息
 	filterInfo := ""
-	totalDbTime := time.Duration(0)
-	for i, filterTime := range filterTimes {
-		if i < len(dbQueryTimes) && i < len(eventCounts) {
-			totalDbTime += dbQueryTimes[i]
-			if i > 0 {
-				filterInfo += ","
-			}
-			filterInfo += fmt.Sprintf("F%d:%v(db:%v,events:%d)", i, filterTime, dbQueryTimes[i], eventCounts[i])
+	for i, result := range results {
+		if i > 0 && (result.filterTime > 0 || result.dbQueryTime > 0) {
+			filterInfo += ","
+		}
+		if result.filterTime > 0 || result.dbQueryTime > 0 {
+			filterInfo += fmt.Sprintf("F%d:%v(db:%v,events:%d)", i, result.filterTime, result.dbQueryTime, result.eventCount)
 		}
 	}
 	
 	// 单行打印时间统计
-	s.Log.Infof("REQ %s timing: Total:%v Filters:%d [%s] TotalDB:%v TotalEvents:%d", 
+	s.Log.Infof("REQ %s timing: Total:%v Filters:%d [%s] TotalDB:%v TotalEvents:%d (parallel)", 
 		id, totalTime, len(filters), filterInfo, totalDbTime, totalEvents)
 
 	ws.WriteJSON(nostr.EOSEEnvelope(id))
