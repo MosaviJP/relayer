@@ -258,6 +258,10 @@ func (s *Server) doCount(ctx context.Context, ws *WebSocket, request []json.RawM
 }
 
 func (s *Server) doReq(ctx context.Context, ws *WebSocket, request []json.RawMessage, store eventstore.Store) string {
+	startTime := time.Now()
+	var filterTimes []time.Duration
+	var dbQueryTimes []time.Duration
+	
 	var id string
 	json.Unmarshal(request[1], &id)
 	if id == "" {
@@ -291,16 +295,25 @@ func (s *Server) doReq(ctx context.Context, ws *WebSocket, request []json.RawMes
 	}
 
 	for idx, filter := range filters {
+		filterStart := time.Now()
+		
 		if limitZeroFlags[idx] {
+			filterTimes = append(filterTimes, time.Since(filterStart))
+			dbQueryTimes = append(dbQueryTimes, 0)
 			continue
 		}
 
 		// prevent kind-4 events from being returned to unauthed users,
 		//   only when authentication is a thing
 
+		dbStart := time.Now()
 		events, err := store.QueryEvents(ctx, filter)
+		dbDuration := time.Since(dbStart)
+		dbQueryTimes = append(dbQueryTimes, dbDuration)
+		
 		if err != nil {
 			s.Log.Errorf("store: %v", err)
+			filterTimes = append(filterTimes, time.Since(filterStart))
 			continue
 		}
 
@@ -325,7 +338,28 @@ func (s *Server) doReq(ctx context.Context, ws *WebSocket, request []json.RawMes
 			for range events {
 			}
 		}
+		
+		filterTimes = append(filterTimes, time.Since(filterStart))
 	}
+
+	totalTime := time.Since(startTime)
+	
+	// 构建单行时间统计信息
+	filterInfo := ""
+	totalDbTime := time.Duration(0)
+	for i, filterTime := range filterTimes {
+		if i < len(dbQueryTimes) {
+			totalDbTime += dbQueryTimes[i]
+			if i > 0 {
+				filterInfo += ","
+			}
+			filterInfo += fmt.Sprintf("F%d:%v(db:%v)", i, filterTime, dbQueryTimes[i])
+		}
+	}
+	
+	// 单行打印时间统计
+	s.Log.Infof("REQ %s timing: Total:%v Filters:%d [%s] TotalDB:%v", 
+		id, totalTime, len(filters), filterInfo, totalDbTime)
 
 	ws.WriteJSON(nostr.EOSEEnvelope(id))
 	setListener(id, ws, filters)
