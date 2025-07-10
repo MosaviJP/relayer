@@ -261,6 +261,8 @@ func (s *Server) doReq(ctx context.Context, ws *WebSocket, request []json.RawMes
 	startTime := time.Now()
 	var filterTimes []time.Duration
 	var dbQueryTimes []time.Duration
+	var eventCounts []int
+	totalEvents := 0
 	
 	var id string
 	json.Unmarshal(request[1], &id)
@@ -296,10 +298,12 @@ func (s *Server) doReq(ctx context.Context, ws *WebSocket, request []json.RawMes
 
 	for idx, filter := range filters {
 		filterStart := time.Now()
+		eventCount := 0
 		
 		if limitZeroFlags[idx] {
 			filterTimes = append(filterTimes, time.Since(filterStart))
 			dbQueryTimes = append(dbQueryTimes, 0)
+			eventCounts = append(eventCounts, 0)
 			continue
 		}
 
@@ -314,6 +318,7 @@ func (s *Server) doReq(ctx context.Context, ws *WebSocket, request []json.RawMes
 		if err != nil {
 			s.Log.Errorf("store: %v", err)
 			filterTimes = append(filterTimes, time.Since(filterStart))
+			eventCounts = append(eventCounts, 0)
 			continue
 		}
 
@@ -332,6 +337,7 @@ func (s *Server) doReq(ctx context.Context, ws *WebSocket, request []json.RawMes
 				}
 				ws.WriteJSON(nostr.EventEnvelope{SubscriptionID: &id, Event: *event})
 				i++
+				eventCount++
 			}
 
 			// exhaust the channel (in case we broke out of it early) so it is closed by the storage
@@ -339,6 +345,8 @@ func (s *Server) doReq(ctx context.Context, ws *WebSocket, request []json.RawMes
 			}
 		}
 		
+		eventCounts = append(eventCounts, eventCount)
+		totalEvents += eventCount
 		filterTimes = append(filterTimes, time.Since(filterStart))
 	}
 
@@ -348,18 +356,18 @@ func (s *Server) doReq(ctx context.Context, ws *WebSocket, request []json.RawMes
 	filterInfo := ""
 	totalDbTime := time.Duration(0)
 	for i, filterTime := range filterTimes {
-		if i < len(dbQueryTimes) {
+		if i < len(dbQueryTimes) && i < len(eventCounts) {
 			totalDbTime += dbQueryTimes[i]
 			if i > 0 {
 				filterInfo += ","
 			}
-			filterInfo += fmt.Sprintf("F%d:%v(db:%v)", i, filterTime, dbQueryTimes[i])
+			filterInfo += fmt.Sprintf("F%d:%v(db:%v,events:%d)", i, filterTime, dbQueryTimes[i], eventCounts[i])
 		}
 	}
 	
 	// 单行打印时间统计
-	s.Log.Infof("REQ %s timing: Total:%v Filters:%d [%s] TotalDB:%v", 
-		id, totalTime, len(filters), filterInfo, totalDbTime)
+	s.Log.Infof("REQ %s timing: Total:%v Filters:%d [%s] TotalDB:%v TotalEvents:%d", 
+		id, totalTime, len(filters), filterInfo, totalDbTime, totalEvents)
 
 	ws.WriteJSON(nostr.EOSEEnvelope(id))
 	setListener(id, ws, filters)
