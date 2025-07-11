@@ -438,6 +438,106 @@ func (s *Server) doAuth(ctx context.Context, ws *WebSocket, request []json.RawMe
 	return ""
 }
 
+type FilterRequest struct {
+	Filters nostr.Filters `json:"filters"`
+}
+
+type QueryResponse struct {
+	Code int             `json:"code"`
+	Msg  string          `json:"msg"`
+	Data []*nostr.Event  `json:"data"`
+}
+
+func (s *Server)HandleHttpReq(w http.ResponseWriter, req *http.Request) {
+	ctx := req.Context()
+	store := s.relay.Storage(ctx)
+	if store == nil {
+		http.Error(w, "no store available", http.StatusInternalServerError)
+		return
+	}
+
+	var reqBody FilterRequest
+	if err := json.NewDecoder(req.Body).Decode(&reqBody); err != nil {
+		http.Error(w, "invalid request body", http.StatusBadRequest)
+		return
+	}
+
+	// 并发查询结果结构
+	type filterResult struct {
+		idx    int
+		events []*nostr.Event
+		err    error
+	}
+
+	// 启动并发查询
+	var wg sync.WaitGroup
+	results := make([]filterResult, len(reqBody.Filters))
+	
+	for idx, filter := range reqBody.Filters {
+		wg.Add(1)
+		go func(idx int, filter nostr.Filter) {
+			defer wg.Done()
+			
+			if filter.Limit == 0 {
+				filter.Limit = 99999999
+			}
+			
+			events, err := store.QueryEvents(ctx, filter)
+			if err != nil {
+				results[idx] = filterResult{
+					idx:    idx,
+					events: nil,
+					err:    err,
+				}
+				return
+			}
+
+			var filterEvents []*nostr.Event
+			count := 0
+			for ev := range events {
+				if s.options.skipEventFunc != nil && s.options.skipEventFunc(ev) {
+					continue
+				}
+				filterEvents = append(filterEvents, ev)
+				count++
+				if count >= filter.Limit {
+					break
+				}
+			}
+			// 耗尽 channel（以防我们提前跳出）
+			for range events {
+			}
+
+			results[idx] = filterResult{
+				idx:    idx,
+				events: filterEvents,
+				err:    nil,
+			}
+		}(idx, filter)
+	}
+
+	// 等待所有查询完成
+	wg.Wait()
+	
+	// 按顺序收集结果，确保事件顺序
+	var allEvents []*nostr.Event
+	for _, result := range results {
+		if result.err != nil {
+			s.Log.Errorf("query error: %v", result.err)
+			continue
+		}
+		allEvents = append(allEvents, result.events...)
+	}
+
+	w.Header().Set("Content-Type", "application/json")
+	json.NewEncoder(w).Encode(QueryResponse{
+		Code: 0,
+		Msg:  "getSessionKeysSuccess",
+		Data: allEvents,
+	})
+}
+
+
 func (s *Server) handleMessage(ctx context.Context, ws *WebSocket, message []byte, store eventstore.Store) {
 	var notice string
 	defer func() {
