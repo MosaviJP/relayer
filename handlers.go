@@ -7,6 +7,7 @@ import (
 	"encoding/hex"
 	"encoding/json"
 	"fmt"
+	"log/slog"
 	"net/http"
 	"sync"
 	"time"
@@ -462,6 +463,7 @@ func (s *Server)HandleHttpReq(w http.ResponseWriter, req *http.Request) {
 		return
 	}
 
+	slog.Debug("HandleHttpReq", "filters", reqBody.Filters)
 	// 并发查询结果结构
 	type filterResult struct {
 		idx    int
