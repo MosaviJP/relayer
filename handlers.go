@@ -453,9 +453,29 @@ func (s *Server) HandleHttpReq(w http.ResponseWriter, req *http.Request) {
     ctx, cancel := context.WithTimeout(req.Context(), 60*time.Second)
     defer cancel()
     
+    // 统一的错误响应函数
+    sendErrorResponse := func(errorMsg string, httpStatus int) {
+        response := QueryResponse{
+            Code: -1,  // 错误状态码
+            Msg:  errorMsg,
+            Data: []*nostr.Event{},  // 空数组
+        }
+        
+        w.Header().Set("Content-Type", "application/json; charset=utf-8")
+        w.Header().Set("Cache-Control", "no-cache")
+        w.WriteHeader(httpStatus)
+        
+        if err := json.NewEncoder(w).Encode(response); err != nil {
+            s.Log.Errorf("failed to encode error response: %v", err)
+            // 最后的兜底，直接写入简单的错误 JSON
+            w.Write([]byte(`{"code":-1,"msg":"internal error: failed to serialize error response","data":[]}`))
+        }
+        s.Log.Errorf("HTTP request failed: %s", errorMsg)
+    }
+    
     store := s.relay.Storage(ctx)
     if store == nil {
-        http.Error(w, "no store available", http.StatusInternalServerError)
+        sendErrorResponse("no store available", http.StatusInternalServerError)
         return
     }
 
@@ -463,7 +483,7 @@ func (s *Server) HandleHttpReq(w http.ResponseWriter, req *http.Request) {
         Filters []json.RawMessage `json:"filters"`
     }
     if err := json.NewDecoder(req.Body).Decode(&reqBody); err != nil {
-        http.Error(w, "invalid request body", http.StatusBadRequest)
+        sendErrorResponse("invalid request body: "+err.Error(), http.StatusBadRequest)
         return
     }
 
@@ -474,7 +494,7 @@ func (s *Server) HandleHttpReq(w http.ResponseWriter, req *http.Request) {
     for i, filterReq := range reqBody.Filters {
         var raw map[string]json.RawMessage
         if err := json.Unmarshal(filterReq, &raw); err != nil {
-            http.Error(w, "failed to decode filter", http.StatusBadRequest)
+            sendErrorResponse("failed to decode filter: "+err.Error(), http.StatusBadRequest)
             return
         }
         if v, ok := raw["limit"]; ok {
@@ -485,7 +505,7 @@ func (s *Server) HandleHttpReq(w http.ResponseWriter, req *http.Request) {
         }
 
         if err := json.Unmarshal(filterReq, &filters[i]); err != nil {
-            http.Error(w, "failed to decode filter", http.StatusBadRequest)
+            sendErrorResponse("failed to decode filter: "+err.Error(), http.StatusBadRequest)
             return
         }
     }
@@ -496,12 +516,13 @@ func (s *Server) HandleHttpReq(w http.ResponseWriter, req *http.Request) {
     const MAX_EVENTS = 100000
     
     // 处理每个 filter（参考 doReq 的逻辑）
+filterLoop:
     for idx, filter := range filters {
         // 检查上下文是否已取消
         select {
         case <-ctx.Done():
             s.Log.Warningf("request timeout at filter %d", idx)
-            break
+            break filterLoop
         default:
         }
         
@@ -512,12 +533,12 @@ func (s *Server) HandleHttpReq(w http.ResponseWriter, req *http.Request) {
         
         // 应用与 doReq 相同的 limit 逻辑
         if filter.Limit == 0 {
-            filter.Limit = 5000  // 默认值改为 5000
+            filter.Limit = 1000  // 进一步降低默认值到 1000
         }
         
-        // 限制单个 filter 最大 5000 条
-        if filter.Limit > 5000 {
-            filter.Limit = 5000
+        // 限制单个 filter 最大 1000 条
+        if filter.Limit > 1000 {
+            filter.Limit = 1000
         }
         
         events, err := store.QueryEvents(ctx, filter)
@@ -536,7 +557,7 @@ func (s *Server) HandleHttpReq(w http.ResponseWriter, req *http.Request) {
                 // 耗尽剩余的 channel
                 for range events {
                 }
-                goto sendResponse
+                break filterLoop
             default:
             }
             
@@ -558,7 +579,7 @@ func (s *Server) HandleHttpReq(w http.ResponseWriter, req *http.Request) {
                 // 耗尽剩余的 channel
                 for range events {
                 }
-                goto sendResponse
+                break filterLoop
             }
             
             filterEvents = append(filterEvents, ev)
@@ -574,29 +595,110 @@ func (s *Server) HandleHttpReq(w http.ResponseWriter, req *http.Request) {
         
         // 检查是否应该停止
         if totalEventCount >= MAX_EVENTS {
-            break
+            break filterLoop
         }
     }
 
-sendResponse:
-    // 一次性构建完整的 JSON 响应
+    // 设置适当的头部
+    w.Header().Set("Content-Type", "application/json; charset=utf-8")
+    w.Header().Set("Cache-Control", "no-cache")
+    
+    // 预先序列化响应以检查大小和有效性
     response := QueryResponse{
         Code: 0,
         Msg:  fmt.Sprintf("getSessionKeysSuccess (%d events)", len(allEvents)),
         Data: allEvents,
     }
     
-    // 设置适当的头部
-    w.Header().Set("Content-Type", "application/json; charset=utf-8")
-    w.Header().Set("Cache-Control", "no-cache")
-    
-    // 编码并发送响应
-    if err := json.NewEncoder(w).Encode(response); err != nil {
-        s.Log.Errorf("failed to encode response: %v", err)
+    responseBytes, err := json.Marshal(response)
+    if err != nil {
+        s.Log.Errorf("failed to marshal response: %v", err)
+        sendErrorResponse("failed to serialize response: "+err.Error(), http.StatusInternalServerError)
         return
     }
     
-    s.Log.Infof("HTTP query completed: %d events", len(allEvents))
+    // 检查响应大小，如果太大则分批返回
+    const MAX_RESPONSE_SIZE = 5 * 1024 * 1024  // 降低到 5MB 限制
+    if len(responseBytes) > MAX_RESPONSE_SIZE {
+        s.Log.Warningf("response too large: %d bytes, truncating to first events", len(responseBytes))
+        
+        // 如果响应太大，逐步减少事件数量直到响应大小合适
+        maxEvents := len(allEvents) / 2
+        for maxEvents > 100 && len(responseBytes) > MAX_RESPONSE_SIZE {
+            truncatedResponse := QueryResponse{
+                Code: 0,
+                Msg:  fmt.Sprintf("getSessionKeysSuccess (%d events, truncated from %d)", maxEvents, len(allEvents)),
+                Data: allEvents[:maxEvents],
+            }
+            responseBytes, err = json.Marshal(truncatedResponse)
+            if err != nil {
+                s.Log.Errorf("failed to marshal truncated response: %v", err)
+                sendErrorResponse("failed to serialize truncated response: "+err.Error(), http.StatusInternalServerError)
+                return
+            }
+            maxEvents = maxEvents / 2
+        }
+        
+        if len(responseBytes) > MAX_RESPONSE_SIZE {
+            s.Log.Errorf("unable to reduce response size below limit")
+            sendErrorResponse("response too large, unable to reduce size", http.StatusRequestEntityTooLarge)
+            return
+        }
+    }
+    
+    s.Log.Infof("sending response: %d events, %d bytes", len(allEvents), len(responseBytes))
+    
+    // 设置 Content-Length 头部
+    w.Header().Set("Content-Length", fmt.Sprintf("%d", len(responseBytes)))
+    
+    // 分块写入大响应，避免 I/O 超时
+    const CHUNK_SIZE = 16 * 1024  // 减小到 16KB 每块
+    totalWritten := 0
+    
+    // 设置更长的写入超时（如果支持的话）
+    if conn, ok := w.(interface{ SetWriteDeadline(time.Time) error }); ok {
+        conn.SetWriteDeadline(time.Now().Add(30 * time.Second))
+    }
+    
+    for totalWritten < len(responseBytes) {
+        // 检查连接是否还活着
+        select {
+        case <-ctx.Done():
+            s.Log.Warningf("client disconnected during response writing at %d/%d bytes", totalWritten, len(responseBytes))
+            return
+        default:
+        }
+        
+        end := totalWritten + CHUNK_SIZE
+        if end > len(responseBytes) {
+            end = len(responseBytes)
+        }
+        
+        chunkSize := end - totalWritten
+        s.Log.Infof("writing chunk %d-%d (%d bytes)", totalWritten, end, chunkSize)
+        
+        written, err := w.Write(responseBytes[totalWritten:end])
+        if err != nil {
+            s.Log.Errorf("failed to write response chunk at offset %d (chunk size %d): %v", totalWritten, chunkSize, err)
+            // 写入失败时，我们已经开始发送响应了，无法再发送错误响应
+            // 只能记录错误并返回，客户端会收到不完整的响应
+            return
+        }
+        
+        totalWritten += written
+        
+        // 强制 flush 确保数据发送
+        if flusher, ok := w.(http.Flusher); ok {
+            flusher.Flush()
+        }
+        
+        // 更长的休息时间，让网络有时间处理
+        if totalWritten < len(responseBytes) {
+            time.Sleep(5 * time.Millisecond)
+        }
+    }
+    
+    s.Log.Infof("HTTP query completed successfully: %d events, %d bytes written", len(allEvents), totalWritten)
 }
 func (s *Server) handleMessage(ctx context.Context, ws *WebSocket, message []byte, store eventstore.Store) {
 	var notice string
