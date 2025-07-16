@@ -458,7 +458,7 @@ func (s *Server) HandleHttpReq(w http.ResponseWriter, req *http.Request) {
         response := QueryResponse{
             Code: -1,  // 错误状态码
             Msg:  errorMsg,
-            Data: []*nostr.Event{},  // 空数组
+            Data: make([]*nostr.Event, 0),  // 确保是空数组而不是 nil
         }
         
         w.Header().Set("Content-Type", "application/json; charset=utf-8")
@@ -511,7 +511,7 @@ func (s *Server) HandleHttpReq(w http.ResponseWriter, req *http.Request) {
     }
 
     // 收集所有事件到内存中（非流式）
-    var allEvents []*nostr.Event
+    var allEvents []*nostr.Event = make([]*nostr.Event, 0)  // 确保初始化为空切片而不是 nil
     totalEventCount := 0
     const MAX_EVENTS = 100000
     
@@ -604,6 +604,11 @@ filterLoop:
     w.Header().Set("Cache-Control", "no-cache")
     
     // 预先序列化响应以检查大小和有效性
+    // 确保 allEvents 不是 nil，即使为空也要是空切片
+    if allEvents == nil {
+        allEvents = make([]*nostr.Event, 0)
+    }
+    
     response := QueryResponse{
         Code: 0,
         Msg:  fmt.Sprintf("getSessionKeysSuccess (%d events)", len(allEvents)),
