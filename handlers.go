@@ -449,7 +449,10 @@ type QueryResponse struct {
 }
 
 func (s *Server) HandleHttpReq(w http.ResponseWriter, req *http.Request) {
-    ctx := req.Context()
+    // 设置请求超时
+    ctx, cancel := context.WithTimeout(req.Context(), 60*time.Second)
+    defer cancel()
+    
     store := s.relay.Storage(ctx)
     if store == nil {
         http.Error(w, "no store available", http.StatusInternalServerError)
@@ -487,81 +490,18 @@ func (s *Server) HandleHttpReq(w http.ResponseWriter, req *http.Request) {
         }
     }
 
-    w.Header().Set("Content-Type", "application/json")
-    w.Header().Set("Cache-Control", "no-cache")
-    
-    // 使用缓冲写入器减少系统调用
-    buf := make([]byte, 0, 32*1024) // 32KB 缓冲区
-    
-    writeWithBuffer := func(data []byte) error {
-        // 检查客户端连接是否还活着
-        select {
-        case <-ctx.Done():
-            return ctx.Err()
-        default:
-        }
-        
-        // 如果缓冲区空间不够，先写入现有缓冲区
-        if len(buf)+len(data) > cap(buf) {
-            if len(buf) > 0 {
-                if _, err := w.Write(buf); err != nil {
-                    return err
-                }
-                buf = buf[:0]
-            }
-            
-            // 如果数据太大，直接写入
-            if len(data) > cap(buf) {
-                _, err := w.Write(data)
-                return err
-            }
-        }
-        
-        buf = append(buf, data...)
-        return nil
-    }
-    
-    flushBuffer := func() error {
-        if len(buf) > 0 {
-            if _, err := w.Write(buf); err != nil {
-                return err
-            }
-            buf = buf[:0]
-        }
-        if flusher, ok := w.(http.Flusher); ok {
-            flusher.Flush()
-        }
-        return nil
-    }
-    
-    // 开始 JSON 响应
-    if err := writeWithBuffer([]byte(`{"code":0,"msg":"getSessionKeysSuccess","data":[`)); err != nil {
-        s.Log.Errorf("failed to write response header: %v", err)
-        return
-    }
-    
-    isFirst := true
-    eventCount := 0
+    // 收集所有事件到内存中（非流式）
+    var allEvents []*nostr.Event
+    totalEventCount := 0
     const MAX_EVENTS = 100000
-    
-    defer func() {
-        // 确保响应完整结束
-        if err := writeWithBuffer([]byte(`]}`)); err != nil {
-            s.Log.Errorf("failed to write response footer: %v", err)
-            return
-        }
-        if err := flushBuffer(); err != nil {
-            s.Log.Errorf("failed to flush final buffer: %v", err)
-        }
-    }()
     
     // 处理每个 filter（参考 doReq 的逻辑）
     for idx, filter := range filters {
         // 检查上下文是否已取消
         select {
         case <-ctx.Done():
-            s.Log.Warningf("request cancelled at filter %d", idx)
-            return
+            s.Log.Warningf("request timeout at filter %d", idx)
+            break
         default:
         }
         
@@ -572,7 +512,12 @@ func (s *Server) HandleHttpReq(w http.ResponseWriter, req *http.Request) {
         
         // 应用与 doReq 相同的 limit 逻辑
         if filter.Limit == 0 {
-            filter.Limit = 10000  // 默认值，而不是无限制
+            filter.Limit = 5000  // 默认值改为 5000
+        }
+        
+        // 限制单个 filter 最大 5000 条
+        if filter.Limit > 5000 {
+            filter.Limit = 5000
         }
         
         events, err := store.QueryEvents(ctx, filter)
@@ -581,16 +526,17 @@ func (s *Server) HandleHttpReq(w http.ResponseWriter, req *http.Request) {
             continue
         }
 
+        var filterEvents []*nostr.Event
         filterEventCount := 0
         for ev := range events {
-            // 再次检查上下文
+            // 检查上下文
             select {
             case <-ctx.Done():
-                s.Log.Warningf("request cancelled while processing events")
+                s.Log.Warningf("request timeout while processing events")
                 // 耗尽剩余的 channel
                 for range events {
                 }
-                return
+                goto sendResponse
             default:
             }
             
@@ -598,7 +544,7 @@ func (s *Server) HandleHttpReq(w http.ResponseWriter, req *http.Request) {
                 continue
             }
             
-            // 检查单个 filter 的 limit（参考 doReq）
+            // 检查单个 filter 的 limit
             if filterEventCount >= filter.Limit {
                 // 耗尽剩余的 channel
                 for range events {
@@ -606,59 +552,51 @@ func (s *Server) HandleHttpReq(w http.ResponseWriter, req *http.Request) {
                 break
             }
             
-            if eventCount >= MAX_EVENTS {
+            // 检查总数限制
+            if totalEventCount >= MAX_EVENTS {
                 s.Log.Infof("reached max events limit (%d), stopping", MAX_EVENTS)
                 // 耗尽剩余的 channel
                 for range events {
                 }
-                goto finish
+                goto sendResponse
             }
             
-            if !isFirst {
-                if err := writeWithBuffer([]byte(",")); err != nil {
-                    s.Log.Errorf("failed to write comma separator: %v", err)
-                    // 耗尽剩余的 channel
-                    for range events {
-                    }
-                    return
-                }
-            }
-            isFirst = false
-            
-            // 序列化事件
-            eventBytes, err := json.Marshal(ev)
-            if err != nil {
-                s.Log.Errorf("failed to marshal event %s: %v", ev.ID, err)
-                continue
-            }
-            
-            // 写入事件数据
-            if err := writeWithBuffer(eventBytes); err != nil {
-                s.Log.Errorf("failed to write event data: %v", err)
-                // 耗尽剩余的 channel
-                for range events {
-                }
-                return
-            }
-            
-            eventCount++
+            filterEvents = append(filterEvents, ev)
             filterEventCount++
-            
-            // 定期 flush，确保数据及时发送
-            if eventCount%50 == 0 {
-                if err := flushBuffer(); err != nil {
-                    s.Log.Errorf("failed to flush buffer at event %d: %v", eventCount, err)
-                    // 耗尽剩余的 channel
-                    for range events {
-                    }
-                    return
-                }
-            }
+            totalEventCount++
+        }
+        
+        // 耗尽 channel 确保清理
+        for range events {
+        }
+        
+        allEvents = append(allEvents, filterEvents...)
+        
+        // 检查是否应该停止
+        if totalEventCount >= MAX_EVENTS {
+            break
         }
     }
 
-finish:
-    s.Log.Infof("HTTP query completed successfully, returned %d events", eventCount)
+sendResponse:
+    // 一次性构建完整的 JSON 响应
+    response := QueryResponse{
+        Code: 0,
+        Msg:  fmt.Sprintf("getSessionKeysSuccess (%d events)", len(allEvents)),
+        Data: allEvents,
+    }
+    
+    // 设置适当的头部
+    w.Header().Set("Content-Type", "application/json; charset=utf-8")
+    w.Header().Set("Cache-Control", "no-cache")
+    
+    // 编码并发送响应
+    if err := json.NewEncoder(w).Encode(response); err != nil {
+        s.Log.Errorf("failed to encode response: %v", err)
+        return
+    }
+    
+    s.Log.Infof("HTTP query completed: %d events", len(allEvents))
 }
 func (s *Server) handleMessage(ctx context.Context, ws *WebSocket, message []byte, store eventstore.Store) {
 	var notice string
