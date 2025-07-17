@@ -463,6 +463,12 @@ func (s *Server) HandleHttpReq(w http.ResponseWriter, req *http.Request) {
     ctx, cancel := context.WithTimeout(req.Context(), 60*time.Second)
     defer cancel()
     
+    // 尝试从请求头中获取用户 pubkey 并添加到 context
+    if userPubkey := req.Header.Get("pubkey"); userPubkey != "" {
+        ctx = context.WithValue(ctx, "userPubkey", userPubkey)
+        s.Log.Infof("HTTP request with user pubkey: %s", userPubkey)
+    }
+    
     // 统一的错误响应函数
     sendErrorResponse := func(errorMsg string, httpStatus int) {
         response := QueryResponse{
@@ -789,7 +795,14 @@ func (s *Server) HandleWebsocket(w http.ResponseWriter, r *http.Request) {
 		)
 	}
 
+	// 创建基础 context
 	ctx, cancel := context.WithCancel(context.Background())
+	
+	// 尝试从请求头中获取用户 pubkey 并添加到 context
+	if userPubkey := r.Header.Get("pubkey"); userPubkey != "" {
+		ctx = context.WithValue(ctx, "userPubkey", userPubkey)
+		s.Log.Infof("WebSocket connection with user pubkey: %s", userPubkey)
+	}
 
 	store := s.relay.Storage(ctx)
 
