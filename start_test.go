@@ -8,7 +8,7 @@ import (
 	"testing"
 	"time"
 
-	"github.com/fiatjaf/eventstore/slicestore"
+	"github.com/MosaviJP/eventstore/slicestore"
 	"github.com/gobwas/ws/wsutil"
 	"github.com/nbd-wtf/go-nostr"
 	"go.uber.org/goleak"

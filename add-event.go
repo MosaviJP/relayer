@@ -5,7 +5,7 @@ import (
 	"fmt"
 	"regexp"
 
-	"github.com/fiatjaf/eventstore"
+	"github.com/MosaviJP/eventstore"
 	"github.com/nbd-wtf/go-nostr"
 )
 
