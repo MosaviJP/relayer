@@ -5,9 +5,9 @@ import (
 	"fmt"
 	"log"
 
-	"github.com/fiatjaf/eventstore"
-	"github.com/fiatjaf/eventstore/elasticsearch"
-	"github.com/fiatjaf/relayer/v2"
+	"github.com/MosaviJP/eventstore"
+	"github.com/MosaviJP/eventstore/elasticsearch"
+	"github.com/MosaviJP/relayer/v2"
 	"github.com/kelseyhightower/envconfig"
 	"github.com/nbd-wtf/go-nostr"
 )

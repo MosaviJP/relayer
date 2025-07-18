@@ -9,7 +9,6 @@ require (
 	github.com/PuerkitoBio/goquery v1.10.1
 	github.com/cockroachdb/pebble v1.1.4
 	github.com/fasthttp/websocket v1.5.12
-	github.com/fiatjaf/eventstore v0.16.2
 	github.com/gobwas/ws v1.4.0
 	github.com/grokify/html-strip-tags-go v0.1.0
 	github.com/jb55/lnsocket/go v0.0.0-20230807153023-0fad35b1352d

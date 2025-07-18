@@ -7,9 +7,9 @@ import (
 	"log"
 	"time"
 
-	"github.com/fiatjaf/eventstore"
-	"github.com/fiatjaf/eventstore/postgresql"
-	"github.com/fiatjaf/relayer/v2"
+	"github.com/MosaviJP/eventstore"
+	"github.com/MosaviJP/eventstore/postgresql"
+	"github.com/MosaviJP/relayer/v2"
 	"github.com/kelseyhightower/envconfig"
 	"github.com/nbd-wtf/go-nostr"
 )
