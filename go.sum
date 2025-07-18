@@ -10,10 +10,8 @@ github.com/ImVexed/fasturl v0.0.0-20230304231329-4e41488060f3 h1:ClzzXMDDuUbWfNN
 github.com/ImVexed/fasturl v0.0.0-20230304231329-4e41488060f3/go.mod h1:we0YA5CsBbH5+/NUzC/AlMmxaDtWlXeNsqrwXjTzmzA=
 github.com/Microsoft/go-winio v0.6.1 h1:9/kr64B9VUZrLm5YYwbGtUJnMgqWVOdUAXu6Migciow=
 github.com/Microsoft/go-winio v0.6.1/go.mod h1:LRdKpFKfdobln8UmuiYcKPot9D2v6svN5+sAH+4kjUM=
-github.com/MosaviJP/eventstore v0.0.0-20250718025430-2590e43a8e69 h1:IfUMvLBP3Tup9U7CuQE0eLJZ4Z7fL2qSYqpLt6OiBOQ=
-github.com/MosaviJP/eventstore v0.0.0-20250718025430-2590e43a8e69/go.mod h1:6KkLS57dZgtTr2alHEdJ7y5HfLjNUZdutRhif/qYUu4=
-github.com/MosaviJP/eventstore v0.0.0-20250718060931-a5837ea911ff h1:r+kHl9LbpU3lZGELGhSHdhmUr3QLNXpzc8o/gHC179A=
-github.com/MosaviJP/eventstore v0.0.0-20250718060931-a5837ea911ff/go.mod h1:6KkLS57dZgtTr2alHEdJ7y5HfLjNUZdutRhif/qYUu4=
+github.com/MosaviJP/eventstore v0.0.0-20250718083612-7160dd4848dd h1:PehN1BSbiom4jpN1KSNJkWvi+42zBhQKA/qtNyYWLeg=
+github.com/MosaviJP/eventstore v0.0.0-20250718083612-7160dd4848dd/go.mod h1:6KkLS57dZgtTr2alHEdJ7y5HfLjNUZdutRhif/qYUu4=
 github.com/Nvveen/Gotty v0.0.0-20120604004816-cd527374f1e5 h1:TngWCqHvy9oXAN6lEVMRuU21PR1EtLVZJmdB18Gu3Rw=
 github.com/Nvveen/Gotty v0.0.0-20120604004816-cd527374f1e5/go.mod h1:lmUJ/7eu/Q8D7ML55dXQrVaamCz2vxCfdQBasLZfHKk=
 github.com/PuerkitoBio/goquery v1.10.1 h1:Y8JGYUkXWTGRB6Ars3+j3kN0xg1YqqlwvdTV8WTFQcU=
