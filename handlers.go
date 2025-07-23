@@ -696,7 +696,7 @@ filterLoop:
         }
         
         chunkSize := end - totalWritten
-        s.Log.Infof("writing chunk %d-%d (%d bytes)", totalWritten, end, chunkSize)
+        // s.Log.Infof("writing chunk %d-%d (%d bytes)", totalWritten, end, chunkSize)
         
         written, err := w.Write(responseBytes[totalWritten:end])
         if err != nil {

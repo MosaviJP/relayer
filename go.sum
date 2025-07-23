@@ -12,6 +12,8 @@ github.com/Microsoft/go-winio v0.6.1 h1:9/kr64B9VUZrLm5YYwbGtUJnMgqWVOdUAXu6Migc
 github.com/Microsoft/go-winio v0.6.1/go.mod h1:LRdKpFKfdobln8UmuiYcKPot9D2v6svN5+sAH+4kjUM=
 github.com/MosaviJP/eventstore v0.0.0-20250722073830-3aeeafc0d5b5 h1:wRfHJfGNU5UpAlwUf22BU2LqOkrUc1J8NMjW9XRccUI=
 github.com/MosaviJP/eventstore v0.0.0-20250722073830-3aeeafc0d5b5/go.mod h1:6KkLS57dZgtTr2alHEdJ7y5HfLjNUZdutRhif/qYUu4=
+github.com/MosaviJP/eventstore v0.0.0-20250723091414-ee2c99f9a789 h1:VaWGb4CT/EEQk/db1JwGjHfl+sc7IjCj5PUdJNlR9LA=
+github.com/MosaviJP/eventstore v0.0.0-20250723091414-ee2c99f9a789/go.mod h1:6KkLS57dZgtTr2alHEdJ7y5HfLjNUZdutRhif/qYUu4=
 github.com/Nvveen/Gotty v0.0.0-20120604004816-cd527374f1e5 h1:TngWCqHvy9oXAN6lEVMRuU21PR1EtLVZJmdB18Gu3Rw=
 github.com/Nvveen/Gotty v0.0.0-20120604004816-cd527374f1e5/go.mod h1:lmUJ/7eu/Q8D7ML55dXQrVaamCz2vxCfdQBasLZfHKk=
 github.com/PuerkitoBio/goquery v1.10.1 h1:Y8JGYUkXWTGRB6Ars3+j3kN0xg1YqqlwvdTV8WTFQcU=
