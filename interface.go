@@ -23,8 +23,10 @@ type Relay interface {
 	// Otherwise, the server responds with a negative and "blocked" message as described
 	// in NIP-20.
 	AcceptEvent(context.Context, *nostr.Event) (bool, string)
-	// Storage returns the relay storage implementation.
+	// Storage returns the relay storage implementation (writer)
 	Storage(context.Context) eventstore.Store
+	// ReaderStorage returns the relay read-only storage implementation (reader, fallback to writer if nil)
+	ReaderStorage(context.Context) eventstore.Store
 }
 
 // ReqAccepter is the main interface for implementing a nostr relay.

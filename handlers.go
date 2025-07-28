@@ -458,7 +458,7 @@ type QueryResponse struct {
 	Data []*nostr.Event  `json:"data"`
 }
 
-func (s *Server) HandleHttpReq(w http.ResponseWriter, req *http.Request) {
+func (s *Server) HandleHttpReq(w http.ResponseWriter, req *http.Request, store eventstore.Store) {
     // 设置请求超时
     ctx, cancel := context.WithTimeout(req.Context(), 60*time.Second)
     defer cancel()
@@ -489,7 +489,6 @@ func (s *Server) HandleHttpReq(w http.ResponseWriter, req *http.Request) {
         s.Log.Errorf("HTTP request failed: %s", errorMsg)
     }
     
-    store := s.relay.Storage(ctx)
     if store == nil {
         sendErrorResponse("no store available", http.StatusInternalServerError)
         return
@@ -721,7 +720,7 @@ filterLoop:
     
     s.Log.Infof("HTTP query completed successfully: %d events, %d bytes written", len(allEvents), totalWritten)
 }
-func (s *Server) handleMessage(ctx context.Context, ws *WebSocket, message []byte, store eventstore.Store) {
+func (s *Server) handleMessage(ctx context.Context, ws *WebSocket, message []byte, defaultStore eventstore.Store) {
 	var notice string
 	defer func() {
 		if notice != "" {
@@ -744,6 +743,13 @@ func (s *Server) handleMessage(ctx context.Context, ws *WebSocket, message []byt
 	json.Unmarshal(request[0], &typ)
 
 	ctx = context.WithValue(ctx, AUTH_CONTEXT_KEY, ws)
+
+	var store = defaultStore
+	if typ == "REQ" || typ == "COUNT" {
+		if reader := s.relay.ReaderStorage(ctx); reader != nil {
+			store = reader
+		}
+	}
 
 	switch typ {
 	case "EVENT":
