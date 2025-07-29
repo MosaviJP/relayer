@@ -153,6 +153,7 @@ func (s *Server) doEvents(
     store eventstore.Store,
 ) string {
     if len(request) < 2 {
+		println("doEvents: request has less than 2 parameters")
         ws.WriteJSON(nostr.OKEnvelope{
             EventID: "",
             OK:      false,
@@ -163,6 +164,7 @@ func (s *Server) doEvents(
 
     var events []nostr.Event
     if err := json.Unmarshal(request[1], &events); err != nil {
+        println("doEvents: failed to decode events array: " + err.Error())
         ws.WriteJSON(nostr.OKEnvelope{
             EventID: "",
             OK:      false,
@@ -176,6 +178,7 @@ func (s *Server) doEvents(
         hash := sha256.Sum256(evt.Serialize())
         computedID := hex.EncodeToString(hash[:])
         if computedID != evt.ID {
+			println("doEvents: invalid event id for " + evt.ID + ", computed=" + computedID)
             ws.WriteJSON(nostr.OKEnvelope{
                 EventID: "",
                 OK:      false,
@@ -187,6 +190,7 @@ func (s *Server) doEvents(
         // 3.2 验签
         sigOK, err := evt.CheckSignature()
         if err != nil {
+			println("doEvents: failed to verify signature for " + evt.ID + ": " + err.Error())
             ws.WriteJSON(nostr.OKEnvelope{
                 EventID: evt.ID,
                 OK:      false,
@@ -194,6 +198,7 @@ func (s *Server) doEvents(
             })
             return ""
         } else if !sigOK {
+			println("doEvents: invalid signature for " + evt.ID)
             ws.WriteJSON(nostr.OKEnvelope{
                 EventID: evt.ID,
                 OK:      false,
@@ -204,6 +209,7 @@ func (s *Server) doEvents(
 
         accept, why := s.relay.AcceptEvent(ctx, &evt)
         if !accept {
+			println("doEvents: event rejected by relay: " + why)
             ws.WriteJSON(nostr.OKEnvelope{
                 EventID: evt.ID,
                 OK:      false,
@@ -216,6 +222,7 @@ func (s *Server) doEvents(
     for _, evt := range events {
         ok, reason := AddEvent(ctx, s.relay, &evt)
         if !ok {
+			println("doEvents: failed to add event " + evt.ID + ": " + reason)
             ws.WriteJSON(nostr.OKEnvelope{
                 EventID: evt.ID,
                 OK:      false,
