@@ -136,9 +136,9 @@ func (s *Server) doEvent(ctx context.Context, ws *WebSocket, request []json.RawM
 			}
 		}
 
-		notifyListeners(&evt)
-		ws.WriteJSON(nostr.OKEnvelope{EventID: evt.ID, OK: true})
-		return ""
+		// notifyListeners(&evt)
+		// ws.WriteJSON(nostr.OKEnvelope{EventID: evt.ID, OK: true})
+		// return ""
 	}
 
 	ok, reason := AddEvent(ctx, s.relay, &evt)
