@@ -141,6 +141,12 @@ func (s *Server) doEvent(ctx context.Context, ws *WebSocket, request []json.RawM
 		// return ""
 	}
 
+	if ctx == nil {
+		fmt.Printf("doEvent: context is nil for event %s\n", evt.ID)
+	} else if ctx.Err() != nil {
+		fmt.Printf("doEvent: context error for event %s: %v\n", evt.ID, ctx.Err())
+	}
+
 	ok, reason := AddEvent(ctx, s.relay, &evt)
 	ws.WriteJSON(nostr.OKEnvelope{EventID: evt.ID, OK: ok, Reason: reason})
 	return ""
@@ -219,19 +225,29 @@ func (s *Server) doEvents(
         }
     }
 
+	accepted, reason := AddEvents(ctx, s.relay, events)
+
     for _, evt := range events {
-        ok, reason := AddEvent(ctx, s.relay, &evt)
-        if !ok {
-			println("doEvents: failed to add event " + evt.ID + ": " + reason)
+        if !accepted{
             ws.WriteJSON(nostr.OKEnvelope{
                 EventID: evt.ID,
-                OK:      false,
+                OK:      accepted,
                 Reason:  fmt.Sprintf("failed to add event: %s", reason),
             })
         } else {
 			ws.WriteJSON(nostr.OKEnvelope{EventID: evt.ID, OK: true})
 		}
     }
+	
+	if !accepted {
+		s.Log.Infof("doEvents: batch failed: %s", reason)
+		ws.WriteJSON(nostr.OKEnvelope{
+			EventID: "",
+			OK:      false,
+			Reason:  fmt.Sprintf("batch failed: %s", reason),
+		})
+		return ""
+	}
 
     ws.WriteJSON(nostr.OKEnvelope{
         EventID: "",
@@ -342,6 +358,11 @@ func (s *Server) doReq(ctx context.Context, ws *WebSocket, request []json.RawMes
 			defer wg.Done()
 			
 			dbStart := time.Now()
+			if ctx == nil {
+				fmt.Printf("doReq: context is nil for filter %d\n", idx)
+			} else if ctx.Err() != nil {
+				fmt.Printf("doReq: context error for filter %d: %v\n", idx, ctx.Err())
+			}
 			events, err := store.QueryEvents(ctx, filter)
 			dbDuration := time.Since(dbStart)
 			

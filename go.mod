@@ -5,7 +5,7 @@ go 1.24.1
 toolchain go1.24.5
 
 require (
-	github.com/MosaviJP/eventstore v0.0.0-20250730064620-672d76c0382a
+	github.com/MosaviJP/eventstore v0.0.0-20250731075610-6d89475a4015
 	github.com/PuerkitoBio/goquery v1.10.1
 	github.com/cockroachdb/pebble v1.1.4
 	github.com/fasthttp/websocket v1.5.12
@@ -136,3 +136,5 @@ require (
 	google.golang.org/protobuf v1.36.5 // indirect
 	gopkg.in/yaml.v3 v3.0.1 // indirect
 )
+
+// replace github.com/MosaviJP/eventstore => ../eventstore

@@ -60,3 +60,38 @@ func AddEvent(ctx context.Context, relay Relay, evt *nostr.Event) (accepted bool
 
 	return true, ""
 }
+
+// AddEvents is a helper function to add multiple events to the relayer
+// It filters out ephemeral events and calls PublishServal on the RelayWrapper
+func AddEvents(ctx context.Context, relay Relay, events []nostr.Event) (accepted bool, message string) {
+	if len(events) == 0 {
+		return true, "AddEvents: no events to add"
+	}
+
+	store := relay.Storage(ctx)
+	wrapper := &eventstore.RelayWrapper{
+		Store: store,
+	}
+
+	var othersEvents []*nostr.Event
+	for _, evt := range events {
+		if nostr.IsEphemeralKind(evt.Kind) {
+			continue
+		}
+		othersEvents = append(othersEvents, &evt)
+	}
+
+	if len(othersEvents) == 0 {
+		return true, "AddEvents: no regular events to add"
+	}
+
+	if err := wrapper.PublishServal(ctx, othersEvents); err != nil {
+		return false, fmt.Sprintf("AddEvents: errors: failed to save events (%s)", err.Error())
+	}
+
+	for _, evt := range events {
+		notifyListeners(&evt)
+	}
+
+	return true, ""
+}
