@@ -1,6 +1,7 @@
 package relayer
 
 import (
+	"fmt"
 	"sync"
 
 	"github.com/nbd-wtf/go-nostr"
@@ -56,6 +57,7 @@ func setListener(id string, ws *WebSocket, filters nostr.Filters) {
 		listeners[ws] = subs
 	}
 
+	fmt.Printf("setting listener %s  with filters %v", id, filters)
 	subs[id] = &Listener{filters: filters}
 }
 
@@ -89,6 +91,7 @@ func notifyListeners(event *nostr.Event) {
 			if !listener.filters.Match(event) {
 				continue
 			}
+			fmt.Printf("notifying listener %s for event %s", id, event.ID)
 			ws.WriteJSON(nostr.EventEnvelope{SubscriptionID: &id, Event: *event})
 		}
 	}
