@@ -83,10 +83,9 @@ func (s *Server) doEvent(ctx context.Context, ws *WebSocket, request []json.RawM
 	if isDisappearingMessage(evt) {
 		if err := s.handleDisappearingMessage(ctx, evt); err != nil {
 			s.Log.Errorf("failed to handle disappearing message %s: %v", evt.ID, err)
-			ws.WriteJSON(nostr.OKEnvelope{EventID: evt.ID, OK: false, Reason: "failed to process disappearing message"})
-			return ""
+		} else {
+			s.Log.Infof("successfully processed disappearing message %s", evt.ID)
 		}
-		s.Log.Infof("successfully processed disappearing message %s", evt.ID)
 	}
 
 	if evt.Kind == 5 {
@@ -233,12 +232,6 @@ func (s *Server) doEvents(
 		err := s.handleDisappearingMessageList(ctx, disappearingEvents)
 		if err != nil {
 			println("doEvents: failed to handle disappearing messages: " + err.Error())
-			ws.WriteJSON(nostr.OKEnvelope{
-				EventID: "",
-				OK:      false,
-				Reason:  "failed to handle disappearing messages: " + err.Error(),
-			})
-			return ""
 		}
 	}
 

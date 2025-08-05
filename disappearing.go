@@ -242,33 +242,32 @@ func (s *Server) handleDisappearingMessageList(ctx context.Context, evt []nostr.
 				var err error
 				ttl, err = strconv.ParseInt(tag[1], 10, 64)
 				if err != nil {
-					return fmt.Errorf("invalid ttl value for event %s: %v", e.ID, err)
+					continue // skip if invalid ttl
 				}
 				if ttl <= 0 {
-					return fmt.Errorf("TTL must be positive for event %s, got %d", e.ID, ttl)
+					continue // skip if TTL is not positive
 				}
 			case "expiration":
 				timestamp, err := strconv.ParseInt(tag[1], 10, 64)
 				if err != nil {
-					return fmt.Errorf("invalid expiration timestamp for event %s: %v", e.ID,
-						err)
+					continue // skip if invalid timestamp
 				}
 				expiration = time.Unix(timestamp, 0)
 				if expiration.Before(time.Now()) {
-					return fmt.Errorf("message %s already expired", e.ID)
+					continue // skip if message already expired
 				}
 			}
 		}
 		if ttl == 0 {
-			return fmt.Errorf("missing ttl tag for event %s", e.ID)
+			continue // skip if no ttl tag found
 		}
 		if expiration.IsZero() {
-			return fmt.Errorf("missing expiration tag for event %s", e.ID)
+			continue // skip if no expiration tag found
 		}
 		createdAt := time.Unix(int64(e.CreatedAt), 0)
 		minExpiration := createdAt.Add(time.Duration(ttl) * time.Second)
 		if expiration.Before(minExpiration) {
-			return fmt.Errorf("expiration time for event %s must be greater than created_at + ttl", e.ID)
+			continue // skip if expiration is not greater than created_at + ttl
 		}
 		msg := &DisappearingMessage{
 			EventID:    e.ID,
@@ -283,7 +282,7 @@ func (s *Server) handleDisappearingMessageList(ctx context.Context, evt []nostr.
                 expiration = EXCLUDED.expiration,
                 created_at = EXCLUDED.created_at`,
 			msg.EventID, msg.TTLSeconds, msg.Expiration, msg.CreatedAt); err != nil {
-			return fmt.Errorf("failed to store disappearing message %s: %v", e.ID, err)
+			s.Log.Errorf("Failed to store disappearing message %s: %v", e.ID, err)
 		}
 		s.Log.Infof("Successfully saved disappearing message %s (TTL: %d, Expires: %s)",
 			e.ID, ttl, expiration.Format(time.RFC3339))
