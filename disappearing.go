@@ -202,6 +202,95 @@ func (s *Server) handleDisappearingMessage(ctx context.Context, evt nostr.Event)
 	return nil
 }
 
+// handle disappearing message list in a transaction
+func (s *Server) handleDisappearingMessageList(ctx context.Context, evt []nostr.Event) error {
+	if len(evt) == 0 {
+		return nil
+	}
+	s.Log.Infof("Processing disappearing message list with %d events", len(evt))
+	disappearingStore, ok := s.relay.(DisappearingMessageSupport)
+	if !ok {
+		return fmt.Errorf("disappearing message store not configured")
+	}
+	store := disappearingStore.GetDisappearingStore()
+	if store == nil {
+		return fmt.Errorf("disappearing message store not available for this backend")
+	}
+	tx, err := store.(*PostgresDisappearingStore).db.BeginTx(ctx, nil)
+	if err != nil {
+		return fmt.Errorf("failed to begin transaction: %w", err)
+	}
+	defer func() {
+		if err != nil {
+			if rollbackErr := tx.Rollback(); rollbackErr != nil {
+				s.Log.Errorf("Failed to rollback transaction: %v", rollbackErr)
+			}
+		} else {
+			if commitErr := tx.Commit(); commitErr != nil {
+				s.Log.Errorf("Failed to commit transaction: %v", commitErr)
+			}
+		}
+	}()
+	for _, e := range evt {
+		ttl, expiration := int64(0), time.Time{}
+		for _, tag := range e.Tags {
+			if len(tag) < 2 {
+				continue
+			}
+			switch tag[0] {
+			case "ttl":
+				var err error
+				ttl, err = strconv.ParseInt(tag[1], 10, 64)
+				if err != nil {
+					return fmt.Errorf("invalid ttl value for event %s: %v", e.ID, err)
+				}
+				if ttl <= 0 {
+					return fmt.Errorf("TTL must be positive for event %s, got %d", e.ID, ttl)
+				}
+			case "expiration":
+				timestamp, err := strconv.ParseInt(tag[1], 10, 64)
+				if err != nil {
+					return fmt.Errorf("invalid expiration timestamp for event %s: %v", e.ID,
+						err)
+				}
+				expiration = time.Unix(timestamp, 0)
+				if expiration.Before(time.Now()) {
+					return fmt.Errorf("message %s already expired", e.ID)
+				}
+			}
+		}
+		if ttl == 0 {
+			return fmt.Errorf("missing ttl tag for event %s", e.ID)
+		}
+		if expiration.IsZero() {
+			return fmt.Errorf("missing expiration tag for event %s", e.ID)
+		}
+		createdAt := time.Unix(int64(e.CreatedAt), 0)
+		minExpiration := createdAt.Add(time.Duration(ttl) * time.Second)
+		if expiration.Before(minExpiration) {
+			return fmt.Errorf("expiration time for event %s must be greater than created_at + ttl", e.ID)
+		}
+		msg := &DisappearingMessage{
+			EventID:    e.ID,
+			TTLSeconds: ttl,
+			Expiration: expiration,
+			CreatedAt:  createdAt,
+		}
+		if _, err := tx.ExecContext(ctx, `INSERT INTO moss_api.dismsg_messages (event_id, ttl_seconds, expiration, created_at)
+            VALUES ($1, $2, $3, $4)
+            ON CONFLICT (event_id) DO UPDATE SET
+                ttl_seconds = EXCLUDED.ttl_seconds,
+                expiration = EXCLUDED.expiration,
+                created_at = EXCLUDED.created_at`,
+			msg.EventID, msg.TTLSeconds, msg.Expiration, msg.CreatedAt); err != nil {
+			return fmt.Errorf("failed to store disappearing message %s: %v", e.ID, err)
+		}
+		s.Log.Infof("Successfully saved disappearing message %s (TTL: %d, Expires: %s)",
+			e.ID, ttl, expiration.Format(time.RFC3339))
+	}		
+	return nil
+}
+
 // StartDisappearingMessageCleanup starts a goroutine that periodically cleans up expired messages
 func StartDisappearingMessageCleanup(ctx context.Context, store DisappearingMessageStore, interval time.Duration) {
 	ticker := time.NewTicker(interval)

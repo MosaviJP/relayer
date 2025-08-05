@@ -57,7 +57,7 @@ func setListener(id string, ws *WebSocket, filters nostr.Filters) {
 		listeners[ws] = subs
 	}
 
-	fmt.Printf("setting listener %s  with filters %v", id, filters)
+	fmt.Printf("setting listener %s with filters %v\n", id, filters)
 	subs[id] = &Listener{filters: filters}
 }
 

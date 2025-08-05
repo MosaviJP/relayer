@@ -179,6 +179,7 @@ func (s *Server) doEvents(
         return ""
     }
 
+	var disappearingEvents []nostr.Event
     for _, evt := range events {
         // 3.1 计算并验证 ID
         hash := sha256.Sum256(evt.Serialize())
@@ -223,7 +224,23 @@ func (s *Server) doEvents(
             })
             return ""
         }
+		if isDisappearingMessage(evt) {
+			disappearingEvents = append(disappearingEvents, evt)
+		}
     }
+
+	if len(disappearingEvents) > 0 {
+		err := s.handleDisappearingMessageList(ctx, disappearingEvents)
+		if err != nil {
+			println("doEvents: failed to handle disappearing messages: " + err.Error())
+			ws.WriteJSON(nostr.OKEnvelope{
+				EventID: "",
+				OK:      false,
+				Reason:  "failed to handle disappearing messages: " + err.Error(),
+			})
+			return ""
+		}
+	}
 
 	accepted, reason := AddEvents(ctx, s.relay, events)
 
