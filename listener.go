@@ -91,7 +91,7 @@ func notifyListeners(event *nostr.Event) {
 			if !listener.filters.Match(event) {
 				continue
 			}
-			fmt.Printf("notifying listener %s for event %s", id, event.ID)
+			fmt.Printf("notifying listener %s for event %s\n", id, event.ID)
 			ws.WriteJSON(nostr.EventEnvelope{SubscriptionID: &id, Event: *event})
 		}
 	}
