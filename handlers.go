@@ -820,6 +820,7 @@ func (s *Server) HandleWebsocket(w http.ResponseWriter, r *http.Request) {
 	s.clientsMu.Lock()
 	defer s.clientsMu.Unlock()
 	s.clients[conn] = struct{}{}
+	s.Log.Infof("length of websocket clients: %d", len(s.clients))
 	ticker := time.NewTicker(pingPeriod)
 
 	ip := conn.RemoteAddr().String()
