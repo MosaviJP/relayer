@@ -5,7 +5,7 @@ go 1.24.1
 toolchain go1.24.5
 
 require (
-	github.com/MosaviJP/eventstore v0.0.0-20250808092211-9f257bc7806a
+	github.com/MosaviJP/eventstore v0.0.0-20250808100147-bc8f9d5e6a0c
 	github.com/PuerkitoBio/goquery v1.10.1
 	github.com/cockroachdb/pebble v1.1.4
 	github.com/fasthttp/websocket v1.5.12
