@@ -81,6 +81,8 @@ func NewServer(relay Relay, opts ...Option) (*Server, error) {
 		return nil, fmt.Errorf("relay init: %w", err)
 	}
 
+	StartResourceMonitoring()
+
 	// start listening from events from other sources, if any
 	if inj, ok := relay.(Injector); ok {
 		go func() {

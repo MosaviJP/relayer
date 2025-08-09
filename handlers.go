@@ -7,8 +7,11 @@ import (
 	"encoding/hex"
 	"encoding/json"
 	"fmt"
+	"log"
 	"net/http"
+	"runtime"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/MosaviJP/eventstore"
@@ -18,6 +21,42 @@ import (
 	"github.com/nbd-wtf/go-nostr/nip42"
 	"golang.org/x/time/rate"
 )
+
+// 全局资源监控计数器
+var (
+	handleMessageGoroutines   int64 // 当前handleMessage goroutine数量
+	doReqGoroutines          int64 // 当前doReq内部goroutine数量  
+	activeChannels           int64 // 当前活跃的event channel数量
+	waitingWaitGroups        int64 // 当前正在等待的WaitGroup数量
+	totalHandleMessageCalls  int64 // handleMessage总调用次数
+	totalDoReqCalls          int64 // doReq总调用次数
+	monitoringStarted        int32 // 确保监控只启动一次
+)
+
+// StartResourceMonitoring 启动资源监控goroutine（导出函数供外部调用）
+func StartResourceMonitoring() {
+	if atomic.CompareAndSwapInt32(&monitoringStarted, 0, 1) {
+		go func() {
+			ticker := time.NewTicker(1 * time.Minute)
+			defer ticker.Stop()
+			
+			for range ticker.C {
+				handleMsgGoroutines := atomic.LoadInt64(&handleMessageGoroutines)
+				doReqGoroutines := atomic.LoadInt64(&doReqGoroutines)
+				activeChannels := atomic.LoadInt64(&activeChannels)
+				waitingWGs := atomic.LoadInt64(&waitingWaitGroups)
+				totalHandleMsgCalls := atomic.LoadInt64(&totalHandleMessageCalls)
+				totalDoReqCalls := atomic.LoadInt64(&totalDoReqCalls)
+				
+				// 使用特别的标识符方便ECS日志搜索
+				log.Printf("NOSTR_RESOURCE_MONITOR handleMessage_goroutines=%d total_handleMessage_calls=%d", handleMsgGoroutines, totalHandleMsgCalls)
+				log.Printf("NOSTR_RESOURCE_MONITOR doReq_goroutines=%d total_doReq_calls=%d", doReqGoroutines, totalDoReqCalls)
+				log.Printf("NOSTR_RESOURCE_MONITOR active_channels=%d waiting_waitgroups=%d", activeChannels, waitingWGs)
+				log.Printf("NOSTR_RESOURCE_MONITOR system_total_goroutines=%d", runtime.NumGoroutine())
+			}
+		}()
+	}
+}
 
 // TODO: consider moving these to Server as config params
 const (
@@ -304,6 +343,8 @@ func (s *Server) doCount(ctx context.Context, ws *WebSocket, request []json.RawM
 func (s *Server) doReq(ctx context.Context, ws *WebSocket, request []json.RawMessage, store eventstore.Store) string {
 	startTime := time.Now()
 	
+	atomic.AddInt64(&totalDoReqCalls, 1)
+	
 	var id string
 	json.Unmarshal(request[1], &id)
 	if id == "" {
@@ -350,6 +391,9 @@ func (s *Server) doReq(ctx context.Context, ws *WebSocket, request []json.RawMes
 	var wg sync.WaitGroup
 	results := make([]filterResult, len(filters))
 	
+	atomic.AddInt64(&waitingWaitGroups, 1)
+	defer atomic.AddInt64(&waitingWaitGroups, -1) // 函数结束时减少计数
+	
 	for idx, filter := range filters {
 		if limitZeroFlags[idx] {
 			results[idx] = filterResult{
@@ -364,8 +408,12 @@ func (s *Server) doReq(ctx context.Context, ws *WebSocket, request []json.RawMes
 		}
 
 		wg.Add(1)
+		atomic.AddInt64(&doReqGoroutines, 1)
 		go func(idx int, filter nostr.Filter) {
-			defer wg.Done()
+			defer func() {
+				wg.Done()
+				atomic.AddInt64(&doReqGoroutines, -1) // 完成时减少计数
+			}()
 			
 			dbStart := time.Now()
 			if ctx == nil {
@@ -817,10 +865,12 @@ func (s *Server) HandleWebsocket(w http.ResponseWriter, r *http.Request) {
 		s.Log.Errorf("failed to upgrade websocket: %v", err)
 		return
 	}
+	
 	s.clientsMu.Lock()
-	defer s.clientsMu.Unlock()
 	s.clients[conn] = struct{}{}
-	s.Log.Infof("length of websocket clients: %d", len(s.clients))
+	clientCount := len(s.clients)
+	s.clientsMu.Unlock()
+	s.Log.Infof("length of websocket clients: %d", clientCount)
 	ticker := time.NewTicker(pingPeriod)
 
 	ip := conn.RemoteAddr().String()
@@ -901,7 +951,13 @@ func (s *Server) HandleWebsocket(w http.ResponseWriter, r *http.Request) {
 				continue
 			}
 
-			go s.handleMessage(ctx, ws, message, store)
+			atomic.AddInt64(&handleMessageGoroutines, 1)
+			atomic.AddInt64(&totalHandleMessageCalls, 1)
+			
+			go func(msg []byte) {
+				defer atomic.AddInt64(&handleMessageGoroutines, -1) // 完成时减少计数
+				s.handleMessage(ctx, ws, msg, store)
+			}(message)
 		}
 	}()
 
