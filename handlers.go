@@ -37,7 +37,7 @@ var (
 func StartResourceMonitoring() {
 	if atomic.CompareAndSwapInt32(&monitoringStarted, 0, 1) {
 		go func() {
-			ticker := time.NewTicker(1 * time.Minute)
+			ticker := time.NewTicker(30 * time.Second)
 			defer ticker.Stop()
 			
 			for range ticker.C {
