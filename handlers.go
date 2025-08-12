@@ -22,37 +22,108 @@ import (
 	"golang.org/x/time/rate"
 )
 
-// 全局资源监控计数器
+// 简化的关键资源监控计数器 - 专注于活跃资源和性能瓶颈
 var (
-	handleMessageGoroutines   int64 // 当前handleMessage goroutine数量
-	doReqGoroutines          int64 // 当前doReq内部goroutine数量  
-	activeChannels           int64 // 当前活跃的event channel数量
-	waitingWaitGroups        int64 // 当前正在等待的WaitGroup数量
-	totalHandleMessageCalls  int64 // handleMessage总调用次数
-	totalDoReqCalls          int64 // doReq总调用次数
-	monitoringStarted        int32 // 确保监控只启动一次
+	// 活跃资源计数（创建+1，释放-1）- 用于检测资源泄漏
+	activeGoroutines          int64 // 当前活跃的goroutine数量（包括handleMessage, doReq等）
+	activeWebSocketConnections int64 // 当前活跃的WebSocket连接数
+	activeEventChannels       int64 // 当前活跃的event channel数量
+	activeEventEnvelopes      int64 // 当前活跃的EventEnvelope数量（创建-序列化完成）
+	activeJSONOperations      int64 // 当前活跃的JSON操作数（解析开始+1，完成-1）
+	activeListeners           int64 // 当前活跃的listener数量
+	waitingWaitGroups         int64 // 当前等待的WaitGroups数量（doReq等）
+	waitGroupGoroutines       int64 // 当前等待的WaitGroup goroutine数量（doReq等）
+
+	// 内存泄漏检测
+	deadConnections           int64 // 检测到的死连接数（累计）
+	suspiciousGrowthEvents    int64 // 可疑内存增长事件（累计）
+	memoryGrowthRate          int64 // 内存增长率(MB/min)
+	lastHeapSize              int64 // 上次记录的heap大小
+	consecutiveGrowthCycles   int64 // 连续增长周期数
+	
+	// notifyListeners性能监控（针对pprof发现的23.65%分配问题）
+	notifyActiveEnvelopes     int64 // notify中活跃的EventEnvelope数量
+	
+	monitoringStarted         int32 // 确保监控只启动一次
 )
 
-// StartResourceMonitoring 启动资源监控goroutine（导出函数供外部调用）
+// StartResourceMonitoring 启动简化的资源监控goroutine（导出函数供外部调用）
 func StartResourceMonitoring() {
 	if atomic.CompareAndSwapInt32(&monitoringStarted, 0, 1) {
 		go func() {
-			ticker := time.NewTicker(30 * time.Second)
+			ticker := time.NewTicker(1 * time.Minute)
 			defer ticker.Stop()
 			
-			for range ticker.C {
-				handleMsgGoroutines := atomic.LoadInt64(&handleMessageGoroutines)
-				doReqGoroutines := atomic.LoadInt64(&doReqGoroutines)
-				activeChannels := atomic.LoadInt64(&activeChannels)
-				waitingWGs := atomic.LoadInt64(&waitingWaitGroups)
-				totalHandleMsgCalls := atomic.LoadInt64(&totalHandleMessageCalls)
-				totalDoReqCalls := atomic.LoadInt64(&totalDoReqCalls)
+		for range ticker.C {
+			// 获取活跃资源计数（这些指标帮助检测资源泄漏）
+			activeGoros := atomic.LoadInt64(&activeGoroutines)
+			activeWSConns := atomic.LoadInt64(&activeWebSocketConnections)
+			activeChannels := atomic.LoadInt64(&activeEventChannels)
+			activeEnvelopes := atomic.LoadInt64(&activeEventEnvelopes)
+			activeJSONOps := atomic.LoadInt64(&activeJSONOperations)
+			activeListenersCount := atomic.LoadInt64(&activeListeners)
+			
+			// 资源泄漏检测指标
+			deadConns := atomic.LoadInt64(&deadConnections)
+			suspiciousGrowth := atomic.LoadInt64(&suspiciousGrowthEvents)
+			growthRate := atomic.LoadInt64(&memoryGrowthRate)
+			consecutiveGrowth := atomic.LoadInt64(&consecutiveGrowthCycles)
+			
+			// notifyListeners性能监控（针对pprof发现的23.65%分配问题）
+			notifyActiveEnvs := atomic.LoadInt64(&notifyActiveEnvelopes)
+			
+			// Global listeners状态监控
+			listenersMutex.Lock()
+			listenersMapSize := len(listeners)
+			totalListenerSubs := 0
+			for _, subs := range listeners {
+				totalListenerSubs += len(subs)
+			}
+			listenersMutex.Unlock()
+			
+			// 获取内存统计信息
+			var memStats runtime.MemStats
+			runtime.ReadMemStats(&memStats)
+			
+			// 内存泄漏检测逻辑
+			currentHeapMB := int64(memStats.HeapAlloc / 1024 / 1024)
+			
+			// 计算内存增长率和可疑行为
+			if lastHeapSize > 0 {
+				growthMB := currentHeapMB - lastHeapSize
+				atomic.StoreInt64(&memoryGrowthRate, growthMB) // MB/minute
 				
-				// 使用特别的标识符方便ECS日志搜索
-				log.Printf("NOSTR_RESOURCE_MONITOR handleMessage_goroutines=%d total_handleMessage_calls=%d", handleMsgGoroutines, totalHandleMsgCalls)
-				log.Printf("NOSTR_RESOURCE_MONITOR doReq_goroutines=%d total_doReq_calls=%d", doReqGoroutines, totalDoReqCalls)
-				log.Printf("NOSTR_RESOURCE_MONITOR active_channels=%d waiting_waitgroups=%d", activeChannels, waitingWGs)
-				log.Printf("NOSTR_RESOURCE_MONITOR system_total_goroutines=%d", runtime.NumGoroutine())
+				// 检测可疑增长（连续增长且增长过快）
+				if growthMB > 50 { // 每分钟增长超过50MB视为可疑
+					atomic.AddInt64(&suspiciousGrowthEvents, 1)
+					atomic.AddInt64(&consecutiveGrowthCycles, 1)
+				} else if growthMB <= 0 {
+					atomic.StoreInt64(&consecutiveGrowthCycles, 0) // 重置连续增长计数
+				}
+			}
+			atomic.StoreInt64(&lastHeapSize, currentHeapMB)
+			
+			// 简化的资源监控输出 - 专注于关键指标
+			// 活跃资源状态（用于检测资源泄漏）
+			log.Printf("NOSTR_RESOURCE_MONITOR active_resources goroutines=%d ws_connections=%d event_channels=%d event_envelopes=%d json_operations=%d listeners=%d", 
+				activeGoros, activeWSConns, activeChannels, activeEnvelopes, activeJSONOps, activeListenersCount)
+
+			log.Printf("NOSTR_RESOURCE_MONITOR waiting_wait_groups=%d wait_group_goroutines=%d", waitingWaitGroups, waitGroupGoroutines)
+
+			// 资源泄漏检测报告（关键！）
+			leakWarning := ""
+			if consecutiveGrowth >= 3 {
+				leakWarning = " LEAK_WARNING=true"
+			}
+			log.Printf("NOSTR_RESOURCE_MONITOR leak_detection dead_connections=%d suspicious_growth=%d growth_rate=%dMB/min consecutive_growth=%d%s", 
+				deadConns, suspiciousGrowth, growthRate, consecutiveGrowth, leakWarning)
+			
+			// notifyListeners性能监控（针对pprof发现的23.65%分配问题）
+			log.Printf("NOSTR_RESOURCE_MONITOR notify_performance active_envelopes=%d", notifyActiveEnvs)
+			
+			// 内存状态摘要
+			log.Printf("NOSTR_RESOURCE_MONITOR memory heap_alloc=%dMB heap_sys=%dMB heap_objects=%d gc_runs=%d total_goroutines=%d listeners_map_size=%d total_subscriptions=%d", 
+				memStats.HeapAlloc/1024/1024, memStats.HeapSys/1024/1024, memStats.HeapObjects, memStats.NumGC, runtime.NumGoroutine(), listenersMapSize, totalListenerSubs)
 			}
 		}()
 	}
@@ -343,10 +414,17 @@ func (s *Server) doCount(ctx context.Context, ws *WebSocket, request []json.RawM
 func (s *Server) doReq(ctx context.Context, ws *WebSocket, request []json.RawMessage, store eventstore.Store) string {
 	startTime := time.Now()
 	
-	atomic.AddInt64(&totalDoReqCalls, 1)
+	// 活跃goroutine计数
+	atomic.AddInt64(&activeGoroutines, 1)
+	defer atomic.AddInt64(&activeGoroutines, -1)
 	
 	var id string
 	json.Unmarshal(request[1], &id)
+	
+	// 监控JSON操作
+	atomic.AddInt64(&activeJSONOperations, 1)
+	defer atomic.AddInt64(&activeJSONOperations, -1)
+	
 	if id == "" {
 		return "REQ has no <id>"
 	}
@@ -408,11 +486,11 @@ func (s *Server) doReq(ctx context.Context, ws *WebSocket, request []json.RawMes
 		}
 
 		wg.Add(1)
-		atomic.AddInt64(&doReqGoroutines, 1)
+		atomic.AddInt64(&waitGroupGoroutines, 1) // 增加等待组goroutine计数
 		go func(idx int, filter nostr.Filter) {
 			defer func() {
 				wg.Done()
-				atomic.AddInt64(&doReqGoroutines, -1) // 完成时减少计数
+				atomic.AddInt64(&waitGroupGoroutines, -1) // 完成时减少计数
 			}()
 			
 			dbStart := time.Now()
@@ -470,6 +548,9 @@ func (s *Server) doReq(ctx context.Context, ws *WebSocket, request []json.RawMes
 				if eventCount >= filter.Limit {
 					break
 				}
+				// 监控：EventEnvelope创建计数（只计活跃的）
+				atomic.AddInt64(&activeEventEnvelopes, 1)
+				
 				ws.WriteJSON(nostr.EventEnvelope{SubscriptionID: &id, Event: *event})
 				eventCount++
 			}
@@ -504,6 +585,10 @@ func (s *Server) doReq(ctx context.Context, ws *WebSocket, request []json.RawMes
 
 	ws.WriteJSON(nostr.EOSEEnvelope(id))
 	setListener(id, ws, filters)
+	
+	// JSON操作监控 - 减少活跃操作计数（doReq结束时）
+	atomic.AddInt64(&activeJSONOperations, -1)
+	
 	return ""
 }
 
@@ -814,6 +899,13 @@ func (s *Server) handleMessage(ctx context.Context, ws *WebSocket, message []byt
 		}
 	}()
 
+	// JSON操作监控 - handleMessage开始
+	atomic.AddInt64(&activeGoroutines, 1)
+	defer atomic.AddInt64(&activeGoroutines, -1)
+	
+	atomic.AddInt64(&activeJSONOperations, 1)
+	defer atomic.AddInt64(&activeJSONOperations, -1)
+
 	var request []json.RawMessage
 	if err := json.Unmarshal(message, &request); err != nil {
 		// stop silently
@@ -860,6 +952,8 @@ func (s *Server) handleMessage(ctx context.Context, ws *WebSocket, message []byt
 }
 
 func (s *Server) HandleWebsocket(w http.ResponseWriter, r *http.Request) {
+	atomic.AddInt64(&activeWebSocketConnections, 1)
+	
 	conn, err := upgrader.Upgrade(w, r, nil)
 	if err != nil {
 		s.Log.Errorf("failed to upgrade websocket: %v", err)
@@ -903,7 +997,9 @@ func (s *Server) HandleWebsocket(w http.ResponseWriter, r *http.Request) {
 
 	// reader
 	go func() {
+		atomic.AddInt64(&activeGoroutines, 1)
 		defer func() {
+			atomic.AddInt64(&activeGoroutines, -1)
 			cancel()
 			ticker.Stop()
 			s.clientsMu.Lock()
@@ -911,6 +1007,7 @@ func (s *Server) HandleWebsocket(w http.ResponseWriter, r *http.Request) {
 				conn.Close()
 				delete(s.clients, conn)
 				removeListener(ws)
+				atomic.AddInt64(&activeWebSocketConnections, -1)
 			}
 			s.clientsMu.Unlock()
 			s.Log.Infof("disconnected from %s", ip)
@@ -951,11 +1048,9 @@ func (s *Server) HandleWebsocket(w http.ResponseWriter, r *http.Request) {
 				continue
 			}
 
-			atomic.AddInt64(&handleMessageGoroutines, 1)
-			atomic.AddInt64(&totalHandleMessageCalls, 1)
-			
 			go func(msg []byte) {
-				defer atomic.AddInt64(&handleMessageGoroutines, -1) // 完成时减少计数
+				atomic.AddInt64(&activeGoroutines, 1)
+				defer atomic.AddInt64(&activeGoroutines, -1)
 				s.handleMessage(ctx, ws, msg, store)
 			}(message)
 		}
@@ -963,7 +1058,9 @@ func (s *Server) HandleWebsocket(w http.ResponseWriter, r *http.Request) {
 
 	// writer
 	go func() {
+		atomic.AddInt64(&activeGoroutines, 1)
 		defer func() {
+			atomic.AddInt64(&activeGoroutines, -1)
 			cancel()
 			ticker.Stop()
 			conn.Close()
