@@ -31,7 +31,8 @@ var (
 	activeEventEnvelopes      int64 // 当前活跃的EventEnvelope数量（创建-序列化完成）
 	activeJSONOperations      int64 // 当前活跃的JSON操作数（解析开始+1，完成-1）
 	activeListeners           int64 // 当前活跃的listener数量
-	
+	allListeners              int64 // 所有listener数量（包括所有WebSocket连接的监听器）
+
 	// 内存泄漏检测
 	deadConnections           int64 // 检测到的死连接数（累计）
 	suspiciousGrowthEvents    int64 // 可疑内存增长事件（累计）
@@ -95,8 +96,8 @@ func StartResourceMonitoring() {
 			
 			// 简化的资源监控输出 - 专注于关键指标
 			// 活跃资源状态（用于检测资源泄漏）
-			log.Printf("NOSTR_RESOURCE_MONITOR active_resources goroutines=%d ws_connections=%d event_channels=%d event_envelopes=%d json_operations=%d listeners=%d", 
-				activeGoros, activeWSConns, activeChannels, activeEnvelopes, activeJSONOps, activeListenersCount)
+			log.Printf("NOSTR_RESOURCE_MONITOR active_resources goroutines=%d ws_connections=%d event_channels=%d event_envelopes=%d json_operations=%d listeners=%d, all_listeners=%d", 
+				activeGoros, activeWSConns, activeChannels, activeEnvelopes, activeJSONOps, activeListenersCount, allListeners)
 
 			// 资源泄漏检测报告（关键！）
 			leakWarning := ""

@@ -103,9 +103,10 @@ func notifyListeners(event *nostr.Event) {
 	notifyCount := 0
 	errorCount := 0
 	brokenConnections := []*WebSocket{}
-
+	listenersCount := 0
 	for ws, subs := range listeners {
 		for id, listener := range subs {
+			listenersCount++ // 统计活跃listener数量
 			if !listener.filters.Match(event) {
 				continue
 			}
@@ -127,7 +128,7 @@ func notifyListeners(event *nostr.Event) {
 			}
 		}
 	}
-	
+	atomic.StoreInt64(&allListeners, int64(listenersCount))
 	// 累计死连接检测计数
 	if len(brokenConnections) > 0 {
 		atomic.AddInt64(&deadConnections, int64(len(brokenConnections)))
