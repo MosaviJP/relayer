@@ -99,7 +99,7 @@ func notifyListeners(event *nostr.Event) {
 	listenersMutex.Lock()
 	defer listenersMutex.Unlock()
 
-	// notifyListeners调用 - 监控活跃envelope
+	// notifyListeners调用 - 只监控活跃envelope
 	notifyCount := 0
 	errorCount := 0
 	brokenConnections := []*WebSocket{}
@@ -111,7 +111,7 @@ func notifyListeners(event *nostr.Event) {
 			}
 			
 			// 创建EventEnvelope时增加活跃计数
-			atomic.AddInt64(&notifyActiveEnvelopes, 1)
+			atomic.AddInt64(&activeEventEnvelopes, 1)
 			
 			err := ws.WriteJSON(nostr.EventEnvelope{SubscriptionID: &id, Event: *event})
 			if err != nil {
@@ -119,11 +119,11 @@ func notifyListeners(event *nostr.Event) {
 				// 标记需要清理的连接，但不在这里删除避免并发问题
 				brokenConnections = append(brokenConnections, ws)
 				fmt.Printf("notifyListeners error for listener %s: %v\n", id, err)
-				// EventEnvelope发送失败，减少活跃计数
-				atomic.AddInt64(&notifyActiveEnvelopes, -1)
+				// EventEnvelope发送失败，减少活跃计数（因为WriteJSON已经不会减少了）
+				atomic.AddInt64(&activeEventEnvelopes, -1)
 			} else {
 				notifyCount++
-				// EventEnvelope成功发送，减少活跃计数（在WriteJSON中处理）
+				// EventEnvelope成功发送，计数已经在WriteJSON中减少了
 			}
 		}
 	}

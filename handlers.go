@@ -31,9 +31,7 @@ var (
 	activeEventEnvelopes      int64 // 当前活跃的EventEnvelope数量（创建-序列化完成）
 	activeJSONOperations      int64 // 当前活跃的JSON操作数（解析开始+1，完成-1）
 	activeListeners           int64 // 当前活跃的listener数量
-	waitingWaitGroups         int64 // 当前等待的WaitGroups数量（doReq等）
-	waitGroupGoroutines       int64 // 当前等待的WaitGroup goroutine数量（doReq等）
-
+	
 	// 内存泄漏检测
 	deadConnections           int64 // 检测到的死连接数（累计）
 	suspiciousGrowthEvents    int64 // 可疑内存增长事件（累计）
@@ -41,13 +39,8 @@ var (
 	lastHeapSize              int64 // 上次记录的heap大小
 	consecutiveGrowthCycles   int64 // 连续增长周期数
 	
-	// notifyListeners性能监控（针对pprof发现的23.65%分配问题）
-	notifyActiveEnvelopes     int64 // notify中活跃的EventEnvelope数量
-	
 	monitoringStarted         int32 // 确保监控只启动一次
-)
-
-// StartResourceMonitoring 启动简化的资源监控goroutine（导出函数供外部调用）
+)// StartResourceMonitoring 启动简化的资源监控goroutine（导出函数供外部调用）
 func StartResourceMonitoring() {
 	if atomic.CompareAndSwapInt32(&monitoringStarted, 0, 1) {
 		go func() {
@@ -68,9 +61,6 @@ func StartResourceMonitoring() {
 			suspiciousGrowth := atomic.LoadInt64(&suspiciousGrowthEvents)
 			growthRate := atomic.LoadInt64(&memoryGrowthRate)
 			consecutiveGrowth := atomic.LoadInt64(&consecutiveGrowthCycles)
-			
-			// notifyListeners性能监控（针对pprof发现的23.65%分配问题）
-			notifyActiveEnvs := atomic.LoadInt64(&notifyActiveEnvelopes)
 			
 			// Global listeners状态监控
 			listenersMutex.Lock()
@@ -108,8 +98,6 @@ func StartResourceMonitoring() {
 			log.Printf("NOSTR_RESOURCE_MONITOR active_resources goroutines=%d ws_connections=%d event_channels=%d event_envelopes=%d json_operations=%d listeners=%d", 
 				activeGoros, activeWSConns, activeChannels, activeEnvelopes, activeJSONOps, activeListenersCount)
 
-			log.Printf("NOSTR_RESOURCE_MONITOR waiting_wait_groups=%d wait_group_goroutines=%d", waitingWaitGroups, waitGroupGoroutines)
-
 			// 资源泄漏检测报告（关键！）
 			leakWarning := ""
 			if consecutiveGrowth >= 3 {
@@ -117,9 +105,6 @@ func StartResourceMonitoring() {
 			}
 			log.Printf("NOSTR_RESOURCE_MONITOR leak_detection dead_connections=%d suspicious_growth=%d growth_rate=%dMB/min consecutive_growth=%d%s", 
 				deadConns, suspiciousGrowth, growthRate, consecutiveGrowth, leakWarning)
-			
-			// notifyListeners性能监控（针对pprof发现的23.65%分配问题）
-			log.Printf("NOSTR_RESOURCE_MONITOR notify_performance active_envelopes=%d", notifyActiveEnvs)
 			
 			// 内存状态摘要
 			log.Printf("NOSTR_RESOURCE_MONITOR memory heap_alloc=%dMB heap_sys=%dMB heap_objects=%d gc_runs=%d total_goroutines=%d listeners_map_size=%d total_subscriptions=%d", 
@@ -469,9 +454,6 @@ func (s *Server) doReq(ctx context.Context, ws *WebSocket, request []json.RawMes
 	var wg sync.WaitGroup
 	results := make([]filterResult, len(filters))
 	
-	atomic.AddInt64(&waitingWaitGroups, 1)
-	defer atomic.AddInt64(&waitingWaitGroups, -1) // 函数结束时减少计数
-	
 	for idx, filter := range filters {
 		if limitZeroFlags[idx] {
 			results[idx] = filterResult{
@@ -486,12 +468,8 @@ func (s *Server) doReq(ctx context.Context, ws *WebSocket, request []json.RawMes
 		}
 
 		wg.Add(1)
-		atomic.AddInt64(&waitGroupGoroutines, 1) // 增加等待组goroutine计数
 		go func(idx int, filter nostr.Filter) {
-			defer func() {
-				wg.Done()
-				atomic.AddInt64(&waitGroupGoroutines, -1) // 完成时减少计数
-			}()
+			defer wg.Done()
 			
 			dbStart := time.Now()
 			if ctx == nil {

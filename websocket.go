@@ -20,15 +20,21 @@ type WebSocket struct {
 }
 
 func (ws *WebSocket) WriteJSON(any interface{}) error {
-	// 监控EventEnvelope序列化（当成功发送时减少活跃计数）
+	// 监控EventEnvelope序列化（只有成功时才减少活跃计数）
+	isEventEnvelope := false
 	if _, ok := any.(nostr.EventEnvelope); ok {
-		// 序列化完成，减少活跃EventEnvelope计数
-		defer atomic.AddInt64(&activeEventEnvelopes, -1)
+		isEventEnvelope = true
 	}
 	
 	ws.mutex.Lock()
 	defer ws.mutex.Unlock()
 	err := ws.conn.WriteJSON(any)
+	
+	// 只有成功发送EventEnvelope时才减少活跃计数
+	if err == nil && isEventEnvelope {
+		atomic.AddInt64(&activeEventEnvelopes, -1)
+	}
+	
 	return err
 }
 
