@@ -96,41 +96,63 @@ func removeListener(ws *WebSocket) {
 }
 
 func notifyListeners(event *nostr.Event) {
+	// 在锁外准备数据，减少锁持有时间
+	var targets []struct {
+		ws *WebSocket
+		id string
+	}
+	var brokenConnections []*WebSocket
+	var listenersCount int
+	
+	// 第一阶段：快速收集需要通知的targets（短时间持锁）
 	listenersMutex.Lock()
-	defer listenersMutex.Unlock()
-
-	// notifyListeners调用 - 只监控活跃envelope
-	notifyCount := 0
-	errorCount := 0
-	brokenConnections := []*WebSocket{}
-	listenersCount := 0
 	for ws, subs := range listeners {
 		for id, listener := range subs {
-			listenersCount++ // 统计活跃listener数量
-			if !listener.filters.Match(event) {
-				continue
-			}
-			
-			// 创建EventEnvelope时增加活跃计数
-			atomic.AddInt64(&activeEventEnvelopes, 1)
-			
-			err := ws.WriteJSON(nostr.EventEnvelope{SubscriptionID: &id, Event: *event})
-			if err != nil {
-				errorCount++
-				// 标记需要清理的连接，但不在这里删除避免并发问题
-				brokenConnections = append(brokenConnections, ws)
-				fmt.Printf("notifyListeners error for listener %s: %v\n", id, err)
-				// EventEnvelope发送失败，减少活跃计数（因为WriteJSON已经不会减少了）
-				atomic.AddInt64(&activeEventEnvelopes, -1)
-			} else {
-				notifyCount++
-				// EventEnvelope成功发送，计数已经在WriteJSON中减少了
+			listenersCount++
+			if listener.filters.Match(event) {
+				targets = append(targets, struct {
+					ws *WebSocket
+					id string
+				}{ws, id})
 			}
 		}
 	}
+	listenersMutex.Unlock()
+	
+	// 第二阶段：在锁外发送通知（避免长时间持锁）
+	notifyCount := 0
+	errorCount := 0
+	
+	for _, target := range targets {
+		// 创建EventEnvelope时增加活跃计数
+		atomic.AddInt64(&activeEventEnvelopes, 1)
+		
+		err := target.ws.WriteJSON(nostr.EventEnvelope{SubscriptionID: &target.id, Event: *event})
+		if err != nil {
+			errorCount++
+			brokenConnections = append(brokenConnections, target.ws)
+			fmt.Printf("notifyListeners error for listener %s: %v\n", target.id, err)
+			// EventEnvelope发送失败，减少活跃计数
+			atomic.AddInt64(&activeEventEnvelopes, -1)
+		} else {
+			notifyCount++
+		}
+	}
 	atomic.StoreInt64(&allListeners, int64(listenersCount))
-	// 累计死连接检测计数
+	
+	// 第三阶段：清理死连接（再次短时间持锁）
 	if len(brokenConnections) > 0 {
 		atomic.AddInt64(&deadConnections, int64(len(brokenConnections)))
+		
+		listenersMutex.Lock()
+		for _, deadWS := range brokenConnections {
+			if subs, ok := listeners[deadWS]; ok {
+				removedCount := len(subs)
+				delete(listeners, deadWS)
+				atomic.AddInt64(&activeListeners, -int64(removedCount))
+				fmt.Printf("removed %d listeners for dead connection\n", removedCount)
+			}
+		}
+		listenersMutex.Unlock()
 	}
 }
