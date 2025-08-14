@@ -58,6 +58,13 @@ func setListener(id string, ws *WebSocket, filters nostr.Filters) {
 		listeners[ws] = subs
 	}
 
+	// METRICS: 区分新增 vs 覆盖（固定 id 的情况计为 update）
+	if _, existed := subs[id]; !existed {
+		atomic.AddInt64(&metricReqNew, 1)
+	} else {
+		atomic.AddInt64(&metricReqUpdate, 1)
+	}
+
 	fmt.Printf("setting listener %s with filters %v\n", id, filters)
 	subs[id] = &Listener{filters: filters}
 	
@@ -71,12 +78,16 @@ func removeListenerId(ws *WebSocket, id string) {
 	defer listenersMutex.Unlock()
 
 	if subs, ok := listeners[ws]; ok {
-		delete(listeners[ws], id)
-		if len(subs) == 0 {
-			delete(listeners, ws)
+		if _, existed := subs[id]; existed {
+			delete(listeners[ws], id)
+			// METRICS
+			atomic.AddInt64(&metricRemovedClose, 1)
+
+			if len(subs) == 0 {
+				delete(listeners, ws)
+			}
+			atomic.AddInt64(&activeListeners, -1)
 		}
-		// 减少活跃listener计数
-		atomic.AddInt64(&activeListeners, -1)
 	}
 }
 
@@ -88,7 +99,11 @@ func removeListener(ws *WebSocket) {
 	// 计算移除的listener数量
 	if subs, ok := listeners[ws]; ok {
 		removedCount := len(subs)
-		atomic.AddInt64(&activeListeners, -int64(removedCount))
+		if removedCount > 0 {
+			// METRICS
+			atomic.AddInt64(&metricRemovedDisconnect, int64(removedCount))
+			atomic.AddInt64(&activeListeners, -int64(removedCount))
+		}
 	}
 	
 	clear(listeners[ws])
@@ -144,15 +159,22 @@ func notifyListeners(event *nostr.Event) {
 	if len(brokenConnections) > 0 {
 		atomic.AddInt64(&deadConnections, int64(len(brokenConnections)))
 		
+		var removedTotal int64
 		listenersMutex.Lock()
 		for _, deadWS := range brokenConnections {
 			if subs, ok := listeners[deadWS]; ok {
 				removedCount := len(subs)
+				removedTotal += int64(removedCount)
 				delete(listeners, deadWS)
 				atomic.AddInt64(&activeListeners, -int64(removedCount))
 				fmt.Printf("removed %d listeners for dead connection\n", removedCount)
 			}
 		}
 		listenersMutex.Unlock()
+
+		// METRICS
+		if removedTotal > 0 {
+			atomic.AddInt64(&metricRemovedWriteFail, removedTotal)
+		}
 	}
 }

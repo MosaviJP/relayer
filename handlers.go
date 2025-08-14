@@ -10,6 +10,7 @@ import (
 	"log"
 	"net/http"
 	"runtime"
+	"sort"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -33,6 +34,13 @@ var (
 	activeListeners           int64 // 当前活跃的listener数量
 	allListeners              int64 // 所有listener数量（包括所有WebSocket连接的监听器）
 
+	metricReqNew                 int64 // 新增订阅id
+    metricReqUpdate              int64 // 复用/覆盖同id
+    metricRemovedClose           int64 // CLOSE 导致的移除
+    metricRemovedDisconnect      int64 // 断连清理导致的移除
+    metricRemovedWriteFail       int64 // 写失败清理导致的移除
+    samplerOnce                  sync.Once
+
 	// 内存泄漏检测
 	deadConnections           int64 // 检测到的死连接数（累计）
 	suspiciousGrowthEvents    int64 // 可疑内存增长事件（累计）
@@ -47,7 +55,14 @@ func StartResourceMonitoring() {
 		go func() {
 			ticker := time.NewTicker(1 * time.Minute)
 			defer ticker.Stop()
-			
+
+			// —— 订阅核算的基线（只用于等式对账）——
+			var (
+				baseSet								 bool
+				baseSubs, baseReqNew					int64
+				baseRemClose, baseRemDisc, baseRemWF	int64
+			)
+
 		for range ticker.C {
 			// 获取活跃资源计数（这些指标帮助检测资源泄漏）
 			activeGoros := atomic.LoadInt64(&activeGoroutines)
@@ -67,8 +82,11 @@ func StartResourceMonitoring() {
 			listenersMutex.Lock()
 			listenersMapSize := len(listeners)
 			totalListenerSubs := 0
+			perWS := make([]int, 0, listenersMapSize)
 			for _, subs := range listeners {
-				totalListenerSubs += len(subs)
+				n := len(subs)
+				totalListenerSubs += n
+				perWS = append(perWS, n)
 			}
 			listenersMutex.Unlock()
 			
@@ -89,7 +107,7 @@ func StartResourceMonitoring() {
 					atomic.AddInt64(&suspiciousGrowthEvents, 1)
 					atomic.AddInt64(&consecutiveGrowthCycles, 1)
 				} else if growthMB <= 0 {
-					atomic.StoreInt64(&consecutiveGrowthCycles, 0) // 重置连续增长计数
+					atomic.StoreInt64(&consecutiveGrowthCycles, 0)
 				}
 			}
 			atomic.StoreInt64(&lastHeapSize, currentHeapMB)
@@ -110,9 +128,63 @@ func StartResourceMonitoring() {
 			// 内存状态摘要
 			log.Printf("NOSTR_RESOURCE_MONITOR memory heap_alloc=%dMB heap_sys=%dMB heap_objects=%d gc_runs=%d total_goroutines=%d listeners_map_size=%d total_subscriptions=%d", 
 				memStats.HeapAlloc/1024/1024, memStats.HeapSys/1024/1024, memStats.HeapObjects, memStats.NumGC, runtime.NumGoroutine(), listenersMapSize, totalListenerSubs)
+
+			// ===== 新增：订阅核算（只打点，不改业务）=====
+			// 分位数（锁外计算）
+			p50, p95, pMax := subsDistStats(perWS)
+
+			// 读取累计计数器
+			reqNew := atomic.LoadInt64(&metricReqNew)
+			reqUpd := atomic.LoadInt64(&metricReqUpdate)
+			remClose := atomic.LoadInt64(&metricRemovedClose)
+			remDisc := atomic.LoadInt64(&metricRemovedDisconnect)
+			remWF := atomic.LoadInt64(&metricRemovedWriteFail)
+
+			// 初始化基线（只执行一次）
+			if !baseSet {
+				baseSet = true
+				baseSubs = int64(totalListenerSubs)
+				baseReqNew = reqNew
+				baseRemClose = remClose
+				baseRemDisc = remDisc
+				baseRemWF = remWF
+			}
+
+			expected := baseSubs +
+				(reqNew - baseReqNew) -
+				((remClose - baseRemClose) + (remDisc - baseRemDisc) + (remWF - baseRemWF))
+			diff := int64(totalListenerSubs) - expected
+
+			// 对账日志：恒等式是否闭合、订阅分布是否“重订阅化”
+			log.Printf("NOSTR_SUBS_ACCOUNTING subs_total_gauge=%d listeners_map_size=%d ws_connections=%d "+
+				"req_new=%d req_update=%d rem_close=%d rem_disconnect=%d rem_writefail=%d "+
+				"expected_subs=%d diff=%d subs_per_ws_p50=%d subs_per_ws_p95=%d subs_per_ws_max=%d",
+				totalListenerSubs, listenersMapSize, activeWSConns,
+				reqNew, reqUpd, remClose, remDisc, remWF,
+				expected, diff, p50, p95, pMax)
 			}
 		}()
 	}
+}
+
+func subsDistStats(xs []int) (p50, p95, pMax int) {
+	if len(xs) == 0 {
+		return 0, 0, 0
+	}
+	ys := make([]int, len(xs))
+	copy(ys, xs)
+	sort.Ints(ys)
+	idx := func(p float64) int {
+		k := int(float64(len(ys)-1) * p)
+		if k < 0 {
+			k = 0
+		}
+		if k >= len(ys) {
+			k = len(ys) - 1
+		}
+		return k
+	}
+	return ys[idx(0.50)], ys[idx(0.95)], ys[len(ys)-1]
 }
 
 // TODO: consider moving these to Server as config params
