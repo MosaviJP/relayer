@@ -1096,10 +1096,10 @@ func (s *Server) HandleWebsocket(w http.ResponseWriter, r *http.Request) {
 			if _, ok := s.clients[conn]; ok {
 				conn.Close()
 				delete(s.clients, conn)
-				removeListener(ws)
 				atomic.AddInt64(&activeWebSocketConnections, -1)
 			}
 			s.clientsMu.Unlock()
+			removeListener(ws)
 			s.Log.Infof("disconnected from %s", ip)
 		}()
 
@@ -1154,6 +1154,7 @@ func (s *Server) HandleWebsocket(w http.ResponseWriter, r *http.Request) {
 			cancel()
 			ticker.Stop()
 			conn.Close()
+			removeListener(ws)
 		}()
 
 		for {
