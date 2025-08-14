@@ -15,6 +15,9 @@ type Listener struct {
 var (
 	listeners      = make(map[*WebSocket]map[string]*Listener)
 	listenersMutex = sync.Mutex{}
+
+	// 关闭闸门，标记正在/已关闭的 ws，防止并发 REQ 回填订阅
+	closingWS      = make(map[*WebSocket]struct{})
 )
 
 func GetListeningFilters() nostr.Filters {
@@ -50,7 +53,14 @@ func GetListeningFilters() nostr.Filters {
 
 func setListener(id string, ws *WebSocket, filters nostr.Filters) {
 	listenersMutex.Lock()
-	defer listenersMutex.Unlock()
+	
+	// 如果 ws 已经在关闭状态，直接丢弃本次REQ，避免并发问题
+	if _, closing := closingWS[ws]; closing {
+		listenersMutex.Unlock()
+		atomic.AddInt64(&metricReqDroppedOnClosed, 1)
+		fmt.Printf("NOSTR_LISTENER_DROP ws=%p conn=%p id=%s reason=closing\n", ws, ws.conn, id)
+		return
+	}
 
 	subs, ok := listeners[ws]
 	if !ok {
@@ -62,17 +72,15 @@ func setListener(id string, ws *WebSocket, filters nostr.Filters) {
 	_, idExisted := subs[id]
 	fmt.Printf("NOSTR_LISTENER_SET ws=%p conn=%p id=%s existed_ws=%t existed_id=%t\n",
 		ws, ws.conn, id, ok, idExisted)
+	subs[id] = &Listener{filters: filters}
+	listenersMutex.Unlock()
+
 	if !idExisted {
 		atomic.AddInt64(&metricReqNew, 1)
+		atomic.AddInt64(&activeListeners, 1)
 	} else {
 		atomic.AddInt64(&metricReqUpdate, 1)
 	}
-
-	fmt.Printf("setting listener %s with filters %v\n", id, filters)
-	subs[id] = &Listener{filters: filters}
-	
-	// 增加活跃listener计数
-	atomic.AddInt64(&activeListeners, 1)
 }
 
 // Remove a specific subscription id from listeners for a given ws client
@@ -99,13 +107,14 @@ func removeListener(ws *WebSocket) int {
 	var removedCount int
 
 	listenersMutex.Lock()
-	
+
 	// 计算移除的listener数量
 	if subs, ok := listeners[ws]; ok {
 		removedCount = len(subs)
 		clear(subs)
 		delete(listeners, ws)
 	}
+	delete(closingWS, ws)
 	listenersMutex.Unlock()
 	
 	if removedCount > 0 {
@@ -167,22 +176,16 @@ func notifyListeners(event *nostr.Event) {
 	if len(brokenConnections) > 0 {
 		atomic.AddInt64(&deadConnections, int64(len(brokenConnections)))
 		
-		var removedTotal int64
-		listenersMutex.Lock()
 		for _, deadWS := range brokenConnections {
-			if subs, ok := listeners[deadWS]; ok {
-				removedCount := len(subs)
-				removedTotal += int64(removedCount)
-				delete(listeners, deadWS)
-				atomic.AddInt64(&activeListeners, -int64(removedCount))
-				fmt.Printf("removed %d listeners for dead connection\n", removedCount)
+			listenersMutex.Lock()
+			closingWS[deadWS] = struct{}{}
+			listenersMutex.Unlock()
+			removedCount := removeListener(deadWS)
+			if removedCount > 0 {
+				// 归因到“写失败”而非“断连”
+				atomic.AddInt64(&metricRemovedWriteFail, int64(removedCount))
+				fmt.Printf("removed %d listeners for dead connection ws=%p\n", removedCount, deadWS)
 			}
-		}
-		listenersMutex.Unlock()
-
-		// METRICS
-		if removedTotal > 0 {
-			atomic.AddInt64(&metricRemovedWriteFail, removedTotal)
 		}
 	}
 }

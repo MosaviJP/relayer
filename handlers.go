@@ -33,6 +33,7 @@ var (
 	activeJSONOperations      int64 // 当前活跃的JSON操作数（解析开始+1，完成-1）
 	activeListeners           int64 // 当前活跃的listener数量
 	allListeners              int64 // 所有listener数量（包括所有WebSocket连接的监听器）
+	metricReqDroppedOnClosed  int64 // NEW: 关闭期间丢弃的 REQ
 
 	metricReqNew                 int64 // 新增订阅id
     metricReqUpdate              int64 // 复用/覆盖同id
@@ -201,6 +202,27 @@ func (s *Server) StartResourceMonitoring() {
 				"orphans_ws=%d orphan_subs=%d avg_subs_per_ws=%.2f",
 				lmSize, wsClients, atomic.LoadInt64(&activeWebSocketConnections),
 				orphanWS, orphanSubs, avgSubsPerWS)	
+
+				// 可选：受控清孤儿（把历史存量清掉，方便观察新的竞态是否还发生）
+				if orphanWS > 0 {
+					cleanedWS := 0
+					cleanedSubs := 0
+					listenersMutex.Lock()
+					for ws, subs := range listeners {
+						if _, ok := activeConns[ws.conn]; !ok {
+							cleanedSubs += len(subs)
+							delete(listeners, ws)
+							delete(closingWS, ws)
+							cleanedWS++
+						}
+					}
+					listenersMutex.Unlock()
+					if cleanedSubs > 0 {
+						atomic.AddInt64(&metricRemovedDisconnect, int64(cleanedSubs))
+						atomic.AddInt64(&activeListeners, -int64(cleanedSubs))
+					}
+					log.Printf("NOSTR_ORPHANS_CLEANED removed_ws=%d removed_subs=%d\n", cleanedWS, cleanedSubs)
+				}
 				if orphanWS > 0 {
 					sample := 0
 					listenersMutex.Lock()
@@ -686,6 +708,14 @@ func (s *Server) doReq(ctx context.Context, ws *WebSocket, request []json.RawMes
 		id, totalTime, len(filters), filterInfo, totalDbTime, totalEvents)
 
 	ws.WriteJSON(nostr.EOSEEnvelope(id))
+	listenersMutex.Lock()
+	_, closing := closingWS[ws]
+	listenersMutex.Unlock()
+	if closing {
+		atomic.AddInt64(&metricReqDroppedOnClosed, 1)
+		fmt.Printf("NOSTR_REQ_DROP ws=%p id=%s reason=closing-before-eose\n", ws, id)
+		return ""
+	}
 	setListener(id, ws, filters)
 	
 	// JSON操作监控 - 减少活跃操作计数（doReq结束时）
@@ -1078,7 +1108,7 @@ func (s *Server) HandleWebsocket(w http.ResponseWriter, r *http.Request) {
 	s.Log.Infof("connected from %s", ip)
 
 	ws := challenge(conn)
-	fmt.Printf("NOSTR_WS_OPEN ws=%p conn=%p", ws, conn)
+	fmt.Printf("NOSTR_WS_OPEN ws=%p conn=%p, ip=%s\n", ws, conn, ip)
 
 	if s.options.perConnectionLimiter != nil {
 		ws.limiter = rate.NewLimiter(
@@ -1103,6 +1133,11 @@ func (s *Server) HandleWebsocket(w http.ResponseWriter, r *http.Request) {
 		atomic.AddInt64(&activeGoroutines, 1)
 		defer func() {
 			atomic.AddInt64(&activeGoroutines, -1)
+
+			listenersMutex.Lock()
+			closingWS[ws] = struct{}{}
+			listenersMutex.Unlock()
+
 			cancel()
 			ticker.Stop()
 			s.clientsMu.Lock()
@@ -1129,6 +1164,11 @@ func (s *Server) HandleWebsocket(w http.ResponseWriter, r *http.Request) {
 		for {
 			typ, message, err := conn.ReadMessage()
 			if err != nil {
+				listenersMutex.Lock()
+				if _, ok := closingWS[ws]; !ok {
+					fmt.Printf("NOSTR_WS_MARK_CLOSING ws=%p conn=%p reason=read_err:%v\n", ws, conn, err)
+				}
+				listenersMutex.Unlock()
 				if websocket.IsUnexpectedCloseError(
 					err,
 					websocket.CloseGoingAway,        // 1001
@@ -1167,12 +1207,15 @@ func (s *Server) HandleWebsocket(w http.ResponseWriter, r *http.Request) {
 		atomic.AddInt64(&activeGoroutines, 1)
 		defer func() {
 			atomic.AddInt64(&activeGoroutines, -1)
+			listenersMutex.Lock()
+			closingWS[ws] = struct{}{}
+			listenersMutex.Unlock()
 			cancel()
 			ticker.Stop()
 			conn.Close()
 			removed := removeListener(ws)
 			if removed > 0 {
-				s.Log.Infof("ws=%p removed_subs=%d (reader)", ws, removed)
+				s.Log.Infof("ws=%p removed_subs=%d (writer)", ws, removed)
 			}
 		}()
 
@@ -1181,6 +1224,12 @@ func (s *Server) HandleWebsocket(w http.ResponseWriter, r *http.Request) {
 			case <-ticker.C:
 				err := conn.WriteControl(websocket.PingMessage, nil, time.Now().Add(writeWait))
 				if err != nil {
+					listenersMutex.Lock()
+					if _, ok := closingWS[ws]; !ok {
+						closingWS[ws] = struct{}{}
+						fmt.Printf("NOSTR_WS_MARK_CLOSING ws=%p conn=%p reason=ping_write_err:%v\n", ws, conn, err)
+					}
+					listenersMutex.Unlock()
 					s.Log.Errorf("error writing ping: %v; closing websocket", err)
 					return
 				}
