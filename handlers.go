@@ -49,8 +49,9 @@ var (
 	consecutiveGrowthCycles   int64 // 连续增长周期数
 	
 	monitoringStarted         int32 // 确保监控只启动一次
-)// StartResourceMonitoring 启动简化的资源监控goroutine（导出函数供外部调用）
-func StartResourceMonitoring() {
+)
+// StartResourceMonitoring 启动简化的资源监控goroutine（导出函数供外部调用）
+func (s *Server) StartResourceMonitoring() {
 	if atomic.CompareAndSwapInt32(&monitoringStarted, 0, 1) {
 		go func() {
 			ticker := time.NewTicker(1 * time.Minute)
@@ -162,6 +163,44 @@ func StartResourceMonitoring() {
 				totalListenerSubs, listenersMapSize, activeWSConns,
 				reqNew, reqUpd, remClose, remDisc, remWF,
 				expected, diff, p50, p95, pMax)
+				// —— Orphan 订阅检测（只打日志，不改逻辑）——
+				
+				// 1) 建立当前活跃底层连接集合（基于 s.clients）
+				s.clientsMu.Lock()
+				wsClients := len(s.clients)
+				activeConns := make(map[*websocket.Conn]struct{}, wsClients)
+				for c := range s.clients {
+					activeConns[c] = struct{}{}
+				}
+				s.clientsMu.Unlock()
+				
+				// 2) 对比 listeners 里的 ws.conn 是否仍在 activeConns
+				listenersMutex.Lock()
+				orphanWS := 0
+				orphanSubs := 0
+				for ws, subs := range listeners {
+					if _, ok := activeConns[ws.conn]; !ok {
+						orphanWS++
+						orphanSubs += len(subs)
+					}
+				}
+				lmSize := len(listeners) // 你已有的 listeners_map_size
+				subTotal := 0
+				for _, subs := range listeners {
+					subTotal += len(subs)
+				}
+				listenersMutex.Unlock()
+				
+				avgSubsPerWS := 0.0
+				if lmSize > 0 {
+					avgSubsPerWS = float64(subTotal) / float64(lmSize)
+				}
+				
+				// 3) 打一行独立日志，用于定位“孤儿订阅”
+				log.Printf("NOSTR_ORPHANS listeners_map_size=%d ws_clients=%d ws_connections_counter=%d "+
+				"orphans_ws=%d orphan_subs=%d avg_subs_per_ws=%.2f",
+				lmSize, wsClients, atomic.LoadInt64(&activeWebSocketConnections),
+				orphanWS, orphanSubs, avgSubsPerWS)	
 			}
 		}()
 	}
