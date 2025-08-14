@@ -58,8 +58,11 @@ func setListener(id string, ws *WebSocket, filters nostr.Filters) {
 		listeners[ws] = subs
 	}
 
-	// METRICS: 区分新增 vs 覆盖（固定 id 的情况计为 update）
-	if _, existed := subs[id]; !existed {
+	// 显示 ws 和底层 conn 的指针，便于与 remove 对齐
+	_, idExisted := subs[id]
+	fmt.Printf("NOSTR_LISTENER_SET ws=%p conn=%p id=%s existed_ws=%t existed_id=%t\n",
+		ws, ws.conn, id, ok, idExisted)
+	if !idExisted {
 		atomic.AddInt64(&metricReqNew, 1)
 	} else {
 		atomic.AddInt64(&metricReqUpdate, 1)
@@ -92,22 +95,27 @@ func removeListenerId(ws *WebSocket, id string) {
 }
 
 // Remove WebSocket conn from listeners
-func removeListener(ws *WebSocket) {
+func removeListener(ws *WebSocket) int {
+	var removedCount int
+
 	listenersMutex.Lock()
-	defer listenersMutex.Unlock()
 	
 	// 计算移除的listener数量
 	if subs, ok := listeners[ws]; ok {
-		removedCount := len(subs)
-		if removedCount > 0 {
-			// METRICS
-			atomic.AddInt64(&metricRemovedDisconnect, int64(removedCount))
-			atomic.AddInt64(&activeListeners, -int64(removedCount))
-		}
+		removedCount = len(subs)
+		clear(subs)
+		delete(listeners, ws)
 	}
+	listenersMutex.Unlock()
 	
-	clear(listeners[ws])
-	delete(listeners, ws)
+	if removedCount > 0 {
+		// METRICS
+		atomic.AddInt64(&metricRemovedDisconnect, int64(removedCount))
+		atomic.AddInt64(&activeListeners, -int64(removedCount))
+	}
+
+	fmt.Printf("NOSTR_REMOVE_LISTENER ws=%p conn=%p removed_subs=%d\n", ws, ws.conn, removedCount)
+	return removedCount
 }
 
 func notifyListeners(event *nostr.Event) {

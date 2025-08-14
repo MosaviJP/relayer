@@ -201,6 +201,18 @@ func (s *Server) StartResourceMonitoring() {
 				"orphans_ws=%d orphan_subs=%d avg_subs_per_ws=%.2f",
 				lmSize, wsClients, atomic.LoadInt64(&activeWebSocketConnections),
 				orphanWS, orphanSubs, avgSubsPerWS)	
+				if orphanWS > 0 {
+					sample := 0
+					listenersMutex.Lock()
+					for ws := range listeners {
+						if _, ok := activeConns[ws.conn]; !ok {
+							log.Printf("NOSTR_ORPHAN_SAMPLE ws=%p conn=%p subs=%d", ws, ws.conn, len(listeners[ws]))
+							sample++
+							if sample >= 5 { break }
+						}
+					}
+					listenersMutex.Unlock()
+				}
 			}
 		}()
 	}
@@ -1066,6 +1078,7 @@ func (s *Server) HandleWebsocket(w http.ResponseWriter, r *http.Request) {
 	s.Log.Infof("connected from %s", ip)
 
 	ws := challenge(conn)
+	fmt.Printf("NOSTR_WS_OPEN ws=%p conn=%p", ws, conn)
 
 	if s.options.perConnectionLimiter != nil {
 		ws.limiter = rate.NewLimiter(
@@ -1099,7 +1112,10 @@ func (s *Server) HandleWebsocket(w http.ResponseWriter, r *http.Request) {
 				atomic.AddInt64(&activeWebSocketConnections, -1)
 			}
 			s.clientsMu.Unlock()
-			removeListener(ws)
+			removed := removeListener(ws)
+			if removed > 0 {
+				s.Log.Infof("ws=%p removed_subs=%d (reader)", ws, removed)
+			}
 			s.Log.Infof("disconnected from %s", ip)
 		}()
 
@@ -1154,7 +1170,10 @@ func (s *Server) HandleWebsocket(w http.ResponseWriter, r *http.Request) {
 			cancel()
 			ticker.Stop()
 			conn.Close()
-			removeListener(ws)
+			removed := removeListener(ws)
+			if removed > 0 {
+				s.Log.Infof("ws=%p removed_subs=%d (reader)", ws, removed)
+			}
 		}()
 
 		for {
