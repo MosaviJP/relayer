@@ -1166,6 +1166,7 @@ func (s *Server) HandleWebsocket(w http.ResponseWriter, r *http.Request) {
 			if err != nil {
 				listenersMutex.Lock()
 				if _, ok := closingWS[ws]; !ok {
+					closingWS[ws] = struct{}{}
 					fmt.Printf("NOSTR_WS_MARK_CLOSING ws=%p conn=%p reason=read_err:%v\n", ws, conn, err)
 				}
 				listenersMutex.Unlock()

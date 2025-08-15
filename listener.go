@@ -54,6 +54,16 @@ func GetListeningFilters() nostr.Filters {
 func setListener(id string, ws *WebSocket, filters nostr.Filters) {
 	listenersMutex.Lock()
 	
+	// print ws to check it exists and connected, make sure don't cause panic in printf	
+	if ws != nil {
+		if ws.conn != nil {
+			fmt.Printf("NOSTR_LISTENER_SET ws=%p conn=%p id=%s\n", ws, ws.conn, id)
+		} else {
+			fmt.Printf("NOSTR_LISTENER_SET ws=%p conn=nil id=%s\n", ws, id)
+		}
+	} else {
+		fmt.Printf("NOSTR_LISTENER_SET ws=nil id=%s\n", id)
+	}
 	// 如果 ws 已经在关闭状态，直接丢弃本次REQ，避免并发问题
 	if _, closing := closingWS[ws]; closing {
 		listenersMutex.Unlock()
