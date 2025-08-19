@@ -666,9 +666,10 @@ func (s *Server) doReq(ctx context.Context, ws *WebSocket, request []json.RawMes
 		eventCount := 0
 		if result.events != nil {
 			for event := range result.events {
-				if s.options.skipEventFunc != nil && s.options.skipEventFunc(event) {
-					continue
-				}
+				// skipEventFunc已在数据库层面处理，无需再次过滤
+				// if s.options.skipEventFunc != nil && s.options.skipEventFunc(event) {
+				// 	continue
+				// }
 				if eventCount >= filter.Limit {
 					break
 				}
@@ -879,9 +880,10 @@ filterLoop:
             default:
             }
             
-            if s.options.skipEventFunc != nil && s.options.skipEventFunc(ev) {
-                continue
-            }
+            // skipEventFunc已在数据库层面处理，无需再次过滤
+            // if s.options.skipEventFunc != nil && s.options.skipEventFunc(ev) {
+            //     continue
+            // }
             
             // 检查单个 filter 的 limit
             if filterEventCount >= filter.Limit {
