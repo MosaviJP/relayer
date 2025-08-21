@@ -16,6 +16,7 @@ import (
 	"time"
 
 	"github.com/MosaviJP/eventstore"
+	"github.com/MosaviJP/eventstore/postgresql"
 	"github.com/fasthttp/websocket"
 	"github.com/nbd-wtf/go-nostr"
 	"github.com/nbd-wtf/go-nostr/nip11"
@@ -320,16 +321,98 @@ func (s *Server) doEvent(ctx context.Context, ws *WebSocket, request []json.RawM
 		return ""
 	}
 
-	// Check for disappearing message and handle it
+	// Always use transaction when using PostgreSQL backend
+	if postgresBackend, ok := store.(*postgresql.PostgresBackend); ok {
+		tx, err := postgresBackend.DB.BeginTxx(ctx, nil)
+		if err != nil {
+			ws.WriteJSON(nostr.OKEnvelope{EventID: evt.ID, OK: false, Reason: "failed to begin transaction"})
+			return ""
+		}
+		defer tx.Rollback()
+
+		// Add transaction to context
+		ctxWithTx := eventstore.WithTx(ctx, tx)
+
+		// Check if this is a disappearing message and handle it
+		if isDisappearingMessage(evt) {
+			if err := s.handleDisappearingMessage(ctxWithTx, evt); err != nil {
+				s.Log.Errorf("failed to handle disappearing message %s: %v", evt.ID, err)
+				ws.WriteJSON(nostr.OKEnvelope{EventID: evt.ID, OK: false, Reason: "failed to handle disappearing message"})
+				return ""
+			}
+		} else if evt.Kind == 5 {
+			// event deletion -- nip09
+			for _, tag := range evt.Tags {
+				if len(tag) >= 2 && tag[0] == "e" {
+					timeoutCtx, cancel := context.WithTimeout(ctxWithTx, time.Millisecond*200)
+					defer cancel()
+
+					// fetch event to be deleted
+					res, err := s.relay.Storage(timeoutCtx).QueryEvents(timeoutCtx, nostr.Filter{IDs: []string{tag[1]}})
+					if err != nil {
+						ws.WriteJSON(nostr.OKEnvelope{EventID: evt.ID, OK: false, Reason: "failed to query for target event"})
+						return ""
+					}
+
+					var target *nostr.Event
+					exists := false
+					select {
+					case target, exists = <-res:
+					case <-timeoutCtx.Done():
+					}
+					if !exists {
+						// this will happen if event is not in the database
+						// or when when the query is taking too long, so we just give up
+						continue
+					}
+
+					// check if this can be deleted
+					if target.PubKey != evt.PubKey {
+						ws.WriteJSON(nostr.OKEnvelope{EventID: evt.ID, OK: false, Reason: "insufficient permissions"})
+						return ""
+					}
+
+					if advancedDeleter != nil {
+						advancedDeleter.BeforeDelete(ctxWithTx, tag[1], evt.PubKey)
+					}
+
+					if err := store.DeleteEvent(ctxWithTx, target); err != nil {
+						ws.WriteJSON(nostr.OKEnvelope{EventID: evt.ID, OK: false, Reason: fmt.Sprintf("error: %s", err.Error())})
+						return ""
+					}
+
+					if advancedDeleter != nil {
+						advancedDeleter.AfterDelete(tag[1], evt.PubKey)
+					}
+				}
+			}
+		}
+
+		// Save event in same transaction
+		ok, reason := AddEvent(ctxWithTx, s.relay, &evt)
+		if !ok {
+			ws.WriteJSON(nostr.OKEnvelope{EventID: evt.ID, OK: false, Reason: reason})
+			return ""
+		}
+
+		// Commit transaction
+		if err := tx.Commit(); err != nil {
+			ws.WriteJSON(nostr.OKEnvelope{EventID: evt.ID, OK: false, Reason: "failed to commit transaction"})
+			return ""
+		}
+
+		ws.WriteJSON(nostr.OKEnvelope{EventID: evt.ID, OK: true})
+		return ""
+	}
+
+	// Fallback for non-PostgreSQL backends
 	if isDisappearingMessage(evt) {
 		if err := s.handleDisappearingMessage(ctx, evt); err != nil {
 			s.Log.Errorf("failed to handle disappearing message %s: %v", evt.ID, err)
 		} else {
 			s.Log.Infof("successfully processed disappearing message %s", evt.ID)
 		}
-	}
-
-	if evt.Kind == 5 {
+	} else if evt.Kind == 5 {
 		// event deletion -- nip09
 		for _, tag := range evt.Tags {
 			if len(tag) >= 2 && tag[0] == "e" {
@@ -375,10 +458,6 @@ func (s *Server) doEvent(ctx context.Context, ws *WebSocket, request []json.RawM
 				}
 			}
 		}
-
-		// notifyListeners(&evt)
-		// ws.WriteJSON(nostr.OKEnvelope{EventID: evt.ID, OK: true})
-		// return ""
 	}
 
 	if ctx == nil {
@@ -469,6 +548,74 @@ func (s *Server) doEvents(
 		}
     }
 
+	// Always use transaction for batch operations when using PostgreSQL backend
+	if postgresBackend, ok := store.(*postgresql.PostgresBackend); ok {
+		tx, err := postgresBackend.DB.BeginTxx(ctx, nil)
+		if err != nil {
+			s.Log.Errorf("doEvents: failed to begin transaction: %v", err)
+			ws.WriteJSON(nostr.OKEnvelope{
+				EventID: "",
+				OK:      false,
+				Reason:  "failed to begin transaction",
+			})
+			return ""
+		}
+		defer tx.Rollback()
+
+		// Add transaction to context
+		ctxWithTx := eventstore.WithTx(ctx, tx)
+
+		// Handle disappearing messages in transaction if any
+		if len(disappearingEvents) > 0 {
+			err = s.handleDisappearingMessageList(ctxWithTx, disappearingEvents)
+			if err != nil {
+				s.Log.Errorf("doEvents: failed to handle disappearing messages: %v", err)
+				ws.WriteJSON(nostr.OKEnvelope{
+					EventID: "",
+					OK:      false,
+					Reason:  "failed to handle disappearing messages",
+				})
+				return ""
+			}
+		}
+
+		// Save events in same transaction
+		accepted, reason := AddEvents(ctxWithTx, s.relay, events)
+		if !accepted {
+			s.Log.Infof("doEvents: batch failed: %s", reason)
+			ws.WriteJSON(nostr.OKEnvelope{
+				EventID: "",
+				OK:      false,
+				Reason:  fmt.Sprintf("batch failed: %s", reason),
+			})
+			return ""
+		}
+
+		// Commit transaction
+		if err := tx.Commit(); err != nil {
+			s.Log.Errorf("doEvents: failed to commit transaction: %v", err)
+			ws.WriteJSON(nostr.OKEnvelope{
+				EventID: "",
+				OK:      false,
+				Reason:  "failed to commit transaction",
+			})
+			return ""
+		}
+
+		// Send success responses for all events
+		for _, evt := range events {
+			ws.WriteJSON(nostr.OKEnvelope{EventID: evt.ID, OK: true})
+		}
+
+		ws.WriteJSON(nostr.OKEnvelope{
+			EventID: "",
+			OK:      true,
+			Reason:  "batch processed",
+		})
+		return ""
+	}
+
+	// Fallback for non-PostgreSQL backends - handle disappearing messages separately
 	if len(disappearingEvents) > 0 {
 		err := s.handleDisappearingMessageList(ctx, disappearingEvents)
 		if err != nil {
@@ -476,6 +623,7 @@ func (s *Server) doEvents(
 		}
 	}
 
+	// No transaction support - use original logic
 	accepted, reason := AddEvents(ctx, s.relay, events)
 
     for _, evt := range events {
