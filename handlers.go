@@ -337,16 +337,44 @@ func (s *Server) doEvent(ctx context.Context, ws *WebSocket, request []json.RawM
 			ws.WriteJSON(nostr.OKEnvelope{EventID: evt.ID, OK: false, Reason: "failed to begin transaction"})
 			return ""
 		}
-		defer tx.Rollback()
+
+		// Set up proper transaction handling with defer
+		var txErr error
+		defer func() {
+			if txErr != nil {
+				tx.Rollback()
+			} else {
+				if commitErr := tx.Commit(); commitErr != nil {
+					s.Log.Errorf("failed to commit transaction for event %s: %v", evt.ID, commitErr)
+				}
+			}
+		}()
 
 		// Add transaction to context
 		ctxWithTx := eventstore.WithTx(ctx, tx)
 
+		// Save event in same transaction
+		ok, reason := AddEvent(ctxWithTx, s.relay, &evt)
+		if !ok {
+			txErr = fmt.Errorf("failed to add event: %s", reason)
+			ws.WriteJSON(nostr.OKEnvelope{EventID: evt.ID, OK: false, Reason: reason})
+			return ""
+		}
+
 		// Check if this is a disappearing message and handle it
 		if isDisappearingMessage(evt) {
 			if err := s.handleDisappearingMessage(ctxWithTx, evt); err != nil {
+				txErr = fmt.Errorf("failed to handle disappearing message: %w", err)
 				s.Log.Errorf("failed to handle disappearing message %s: %v", evt.ID, err)
 				ws.WriteJSON(nostr.OKEnvelope{EventID: evt.ID, OK: false, Reason: "failed to handle disappearing message"})
+				return ""
+			}
+		} else if evt.Kind == 3046 || evt.Kind == 3047 {
+			// Handle group management events (3046: newGen, 3047: join)
+			if err := s.handleGroupManagementEventInline(ctxWithTx, &evt); err != nil {
+				txErr = fmt.Errorf("failed to handle group management event: %w", err)
+				s.Log.Errorf("failed to handle group management event %s: %v", evt.ID, err)
+				ws.WriteJSON(nostr.OKEnvelope{EventID: evt.ID, OK: false, Reason: "failed to handle group management"})
 				return ""
 			}
 		} else if evt.Kind == 5 {
@@ -359,6 +387,7 @@ func (s *Server) doEvent(ctx context.Context, ws *WebSocket, request []json.RawM
 					// fetch event to be deleted
 					res, err := s.relay.Storage(timeoutCtx).QueryEvents(timeoutCtx, nostr.Filter{IDs: []string{tag[1]}})
 					if err != nil {
+						txErr = fmt.Errorf("failed to query for target event: %w", err)
 						ws.WriteJSON(nostr.OKEnvelope{EventID: evt.ID, OK: false, Reason: "failed to query for target event"})
 						return ""
 					}
@@ -377,6 +406,7 @@ func (s *Server) doEvent(ctx context.Context, ws *WebSocket, request []json.RawM
 
 					// check if this can be deleted
 					if target.PubKey != evt.PubKey {
+						txErr = fmt.Errorf("insufficient permissions to delete event")
 						ws.WriteJSON(nostr.OKEnvelope{EventID: evt.ID, OK: false, Reason: "insufficient permissions"})
 						return ""
 					}
@@ -386,6 +416,7 @@ func (s *Server) doEvent(ctx context.Context, ws *WebSocket, request []json.RawM
 					}
 
 					if err := store.DeleteEvent(ctxWithTx, target); err != nil {
+						txErr = fmt.Errorf("failed to delete event: %w", err)
 						ws.WriteJSON(nostr.OKEnvelope{EventID: evt.ID, OK: false, Reason: fmt.Sprintf("error: %s", err.Error())})
 						return ""
 					}
@@ -397,20 +428,9 @@ func (s *Server) doEvent(ctx context.Context, ws *WebSocket, request []json.RawM
 			}
 		}
 
-		// Save event in same transaction
-		ok, reason := AddEvent(ctxWithTx, s.relay, &evt)
-		if !ok {
-			ws.WriteJSON(nostr.OKEnvelope{EventID: evt.ID, OK: false, Reason: reason})
-			return ""
-		}
-
-		// Commit transaction
-		if err := tx.Commit(); err != nil {
-			ws.WriteJSON(nostr.OKEnvelope{EventID: evt.ID, OK: false, Reason: "failed to commit transaction"})
-			return ""
-		}
-
+		// If we reach here, all operations succeeded
 		ws.WriteJSON(nostr.OKEnvelope{EventID: evt.ID, OK: true})
+		// txErr remains nil, so defer will commit the transaction
 		return ""
 	}
 
@@ -508,6 +528,7 @@ func (s *Server) doEvents(
     }
 
 	var disappearingEvents []nostr.Event
+	var groupManagementEvents []nostr.Event
     for _, evt := range events {
         // 3.1 计算并验证 ID
         hash := sha256.Sum256(evt.Serialize())
@@ -555,6 +576,9 @@ func (s *Server) doEvents(
 		if isDisappearingMessage(evt) {
 			disappearingEvents = append(disappearingEvents, evt)
 		}
+		if evt.Kind == 3046 || evt.Kind == 3047 {
+			groupManagementEvents = append(groupManagementEvents, evt)
+		}
     }
 
 	// Always use transaction for batch operations when using PostgreSQL backend
@@ -569,7 +593,18 @@ func (s *Server) doEvents(
 			})
 			return ""
 		}
-		defer tx.Rollback()
+
+		// Set up proper transaction handling with defer
+		var txErr error
+		defer func() {
+			if txErr != nil {
+				tx.Rollback()
+			} else {
+				if commitErr := tx.Commit(); commitErr != nil {
+					s.Log.Errorf("doEvents: failed to commit transaction: %v", commitErr)
+				}
+			}
+		}()
 
 		// Add transaction to context
 		ctxWithTx := eventstore.WithTx(ctx, tx)
@@ -578,6 +613,7 @@ func (s *Server) doEvents(
 		if len(disappearingEvents) > 0 {
 			err = s.handleDisappearingMessageList(ctxWithTx, disappearingEvents)
 			if err != nil {
+				txErr = fmt.Errorf("failed to handle disappearing messages: %w", err)
 				s.Log.Errorf("doEvents: failed to handle disappearing messages: %v", err)
 				ws.WriteJSON(nostr.OKEnvelope{
 					EventID: "",
@@ -588,9 +624,26 @@ func (s *Server) doEvents(
 			}
 		}
 
+		// Handle group management events in transaction if any
+		if len(groupManagementEvents) > 0 {
+			for _, evt := range groupManagementEvents {
+				if err := s.handleGroupManagementEventInline(ctxWithTx, &evt); err != nil {
+					txErr = fmt.Errorf("failed to handle group management event %s: %w", evt.ID, err)
+					s.Log.Errorf("doEvents: failed to handle group management event %s: %v", evt.ID, err)
+					ws.WriteJSON(nostr.OKEnvelope{
+						EventID: evt.ID,
+						OK:      false,
+						Reason:  "failed to handle group management events",
+					})
+					return ""
+				}
+			}
+		}
+
 		// Save events in same transaction
 		accepted, reason := AddEvents(ctxWithTx, s.relay, events)
 		if !accepted {
+			txErr = fmt.Errorf("batch failed: %s", reason)
 			s.Log.Infof("doEvents: batch failed: %s", reason)
 			ws.WriteJSON(nostr.OKEnvelope{
 				EventID: "",
@@ -600,17 +653,7 @@ func (s *Server) doEvents(
 			return ""
 		}
 
-		// Commit transaction
-		if err := tx.Commit(); err != nil {
-			s.Log.Errorf("doEvents: failed to commit transaction: %v", err)
-			ws.WriteJSON(nostr.OKEnvelope{
-				EventID: "",
-				OK:      false,
-				Reason:  "failed to commit transaction",
-			})
-			return ""
-		}
-
+		// If we reach here, all operations succeeded
 		// Send success responses for all events
 		for _, evt := range events {
 			ws.WriteJSON(nostr.OKEnvelope{EventID: evt.ID, OK: true})
@@ -621,6 +664,7 @@ func (s *Server) doEvents(
 			OK:      true,
 			Reason:  "batch processed",
 		})
+		// txErr remains nil, so defer will commit the transaction
 		return ""
 	}
 
