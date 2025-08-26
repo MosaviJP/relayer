@@ -596,6 +596,21 @@ func (s *Server) doReq(ctx context.Context, ws *WebSocket, request []json.RawMes
 		}
 	}
 
+	listenersMutex.Lock()
+	_, closing := closingWS[ws]
+	listenersMutex.Unlock()
+
+	s.clientsMu.Lock()
+	_, alive := s.clients[ws.conn]
+	s.clientsMu.Unlock()
+
+	if closing || !alive {
+		atomic.AddInt64(&metricReqDroppedOnClosed, 1)
+		fmt.Printf("NOSTR_REQ_DROP ws=%p id=%s reason=%s\n", ws, id,
+			map[bool]string{true: "closing", false: "conn-not-in-clients"}[closing])
+		return ""
+	}
+
 	// 并行查询结果结构
 	type filterResult struct {
 		idx         int
@@ -682,22 +697,36 @@ func (s *Server) doReq(ctx context.Context, ws *WebSocket, request []json.RawMes
 				if eventCount >= filter.Limit {
 					break
 				}
-				// 活跃计数 +1，写完一定 -1
-			    atomic.AddInt64(&activeEventEnvelopes, 1)
-			    if err := ws.WriteJSON(nostr.EventEnvelope{SubscriptionID: &id, Event: *event}); err != nil {
-			    	// 把这条连接标记为 closing，阻断后续 setListener
-			        listenersMutex.Lock()
-			        if _, ok := closingWS[ws]; !ok {
-			            closingWS[ws] = struct{}{}
-			            fmt.Printf("NOSTR_WS_MARK_CLOSING ws=%p conn=%p reason=history_write_err:%v\n", ws, ws.conn, err)
-			        }
-			        listenersMutex.Unlock()
-			        atomic.AddInt64(&activeEventEnvelopes, -1)
-			        // 直接退出本次 REQ；不要再写 EOSE / setListener
-			        return ""
-			    }
-			    atomic.AddInt64(&activeEventEnvelopes, -1)
-			    eventCount++
+				// 活跃计数 +1
+				atomic.AddInt64(&activeEventEnvelopes, 1)
+				if err := ws.WriteJSON(nostr.EventEnvelope{SubscriptionID: &id, Event: *event}); err != nil {
+					// 标记 closing
+					listenersMutex.Lock()
+					if _, ok := closingWS[ws]; !ok {
+						closingWS[ws] = struct{}{}
+						fmt.Printf("NOSTR_WS_MARK_CLOSING ws=%p conn=%p reason=history_write_err:%v\n", ws, ws.conn, err)
+					}
+					listenersMutex.Unlock()
+
+					// **立刻取消本次 REQ 的 ctx**
+					cancel()
+
+					// **把当前 filter 的剩余 events 丢弃干净**
+					go drainEvents(result.events, 3*time.Second)
+
+					// **把后续 filters 的 events 也丢弃干净**（它们的 channel 已经在 results 里）
+					for j := idx + 1; j < len(results); j++ {
+						if results[j].events != nil {
+							go drainEvents(results[j].events, 3*time.Second)
+						}
+					}
+
+					// 计数 -1 后退出
+					atomic.AddInt64(&activeEventEnvelopes, -1)
+					return ""
+				}
+				atomic.AddInt64(&activeEventEnvelopes, -1)
+				eventCount++
 			}
 
 			// 耗尽 channel（以防我们提前跳出），这样存储层会关闭它
@@ -741,11 +770,11 @@ func (s *Server) doReq(ctx context.Context, ws *WebSocket, request []json.RawMes
 
 	// 双保险：1) 关闭闸门  2) conn 仍在 s.clients
 	listenersMutex.Lock()
-	_, closing := closingWS[ws]
+	_, closing = closingWS[ws]
 	listenersMutex.Unlock()
 
 	s.clientsMu.Lock()
-	_, alive := s.clients[ws.conn]
+	_, alive = s.clients[ws.conn]
 	s.clientsMu.Unlock()
 
 	if closing || !alive {
@@ -757,6 +786,25 @@ func (s *Server) doReq(ctx context.Context, ws *WebSocket, request []json.RawMes
 	setListener(id, ws, filters)
 	
 	return ""
+}
+
+// 丢弃并尽快排空一个事件通道，最多等 maxDur（避免卡死）
+func drainEvents(ch <-chan *nostr.Event, maxDur time.Duration) {
+    if ch == nil {
+        return
+    }
+    deadline := time.NewTimer(maxDur)
+    defer deadline.Stop()
+    for {
+        select {
+        case _, ok := <-ch:
+            if !ok {
+                return // 正常关闭
+            }
+        case <-deadline.C:
+            return // 到时放弃
+        }
+    }
 }
 
 func (s *Server) doClose(ctx context.Context, ws *WebSocket, request []json.RawMessage, store eventstore.Store) string {
