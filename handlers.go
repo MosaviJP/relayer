@@ -6,11 +6,14 @@ import (
 	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"log"
 	"net/http"
+	"os"
 	"runtime"
 	"sort"
+	"strconv"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -553,6 +556,13 @@ func (s *Server) doReq(ctx context.Context, ws *WebSocket, request []json.RawMes
 	reqCtx, cancel := context.WithCancel(ctx)
 	defer cancel()
 	
+	filterTimeout := 8 * time.Second
+	if v := os.Getenv("RELAY_DB_FILTER_TIMEOUT"); v != "" {
+		if n, err := strconv.Atoi(v); err == nil && n > 0 {
+			filterTimeout = time.Duration(n) * time.Second
+		}
+	}
+
 	startTime := time.Now()
 	
 	// 活跃goroutine计数
@@ -642,13 +652,42 @@ func (s *Server) doReq(ctx context.Context, ws *WebSocket, request []json.RawMes
 		go func(idx int, filter nostr.Filter) {
 			defer wg.Done()
 			
-			dbStart := time.Now()
-			if ctx == nil {
-				fmt.Printf("doReq: context is nil for filter %d\n", idx)
-			} else if ctx.Err() != nil {
-				fmt.Printf("doReq: context error for filter %d: %v\n", idx, ctx.Err())
+			acqStart := time.Now()
+			if s.dbSem != nil {
+				select {
+					case s.dbSem <- struct{}{}:
+					case <-reqCtx.Done():
+						results[idx] = filterResult{idx: idx, events: nil, err: reqCtx.Err()}
+						return
+				}
+				defer func() {<-s.dbSem}()
 			}
-			events, err := store.QueryEvents(reqCtx, filter)
+			
+			qctx, qcancel := context.WithTimeout(reqCtx, filterTimeout)
+			defer qcancel()
+
+			dbStart := time.Now()
+			if qctx == nil {
+				fmt.Printf("doReq: context is nil for filter %d\n", idx)
+			} else if qctx.Err() != nil {
+				fmt.Printf("doReq: context error for filter %d: %v\n", idx, qctx.Err())
+			}
+
+			if (len(filter.Authors) == 0 && len(filter.Tags) == 0 && filter.Kinds == nil && filter.Since == nil && filter.Until == nil && filter.Search == "") && filter.Limit == 0 {
+				results[idx] = filterResult{idx: idx, events: nil, err: nil}
+				return
+			}
+
+			// 发起查询
+			events, err := store.QueryEvents(qctx, filter)
+			if err != nil && errors.Is(err, context.DeadlineExceeded) {
+				// 单 filter 超时：打断整次 REQ（不写 EOSE、不 setListener），让客户端自行重试
+				fmt.Printf("REQ filter timeout ws=%p id=%s idx=%d waited=%v db=%v\n", ws, id, idx, time.Since(acqStart), time.Since(dbStart))
+				cancel() // 取消整个 reqCtx，下面写环节会感知
+				results[idx] = filterResult{idx: idx, events: nil, err: err, dbQueryTime: time.Since(dbStart)}
+				return
+			}
+
 			dbDuration := time.Since(dbStart)
 			
 			results[idx] = filterResult{
@@ -676,6 +715,13 @@ func (s *Server) doReq(ctx context.Context, ws *WebSocket, request []json.RawMes
 
 		eventProcessStart := time.Now()
 		
+		// 如果上面已经因为某个 filter 超时/取消了整个 reqCtx，这里直接退出
+		select {
+		case <-reqCtx.Done():
+			return ""
+		default:
+		}
+
 		if result.err != nil {
 			s.Log.Errorf("store: %v", result.err)
 			results[idx].filterTime = time.Since(eventProcessStart)
@@ -696,6 +742,12 @@ func (s *Server) doReq(ctx context.Context, ws *WebSocket, request []json.RawMes
 				}
 				if eventCount >= filter.Limit {
 					break
+				}
+				// 再次检查是否已经超时/取消
+				select {
+				case <-reqCtx.Done():
+					return ""
+				default:
 				}
 				// 活跃计数 +1
 				atomic.AddInt64(&activeEventEnvelopes, 1)
@@ -752,7 +804,13 @@ func (s *Server) doReq(ctx context.Context, ws *WebSocket, request []json.RawMes
 			filterInfo += fmt.Sprintf("F%d:%v(db:%v,events:%d)", i, result.filterTime, result.dbQueryTime, result.eventCount)
 		}
 	}
-	
+	// 如果是因为某个 filter 超时/取消导致整个 reqCtx 结束，则不写 EOSE / 不 setListener
+	select {
+	case <-reqCtx.Done():
+		return ""
+	default:
+	}
+
 	// 单行打印时间统计
 	s.Log.Infof("REQ %s timing: Total:%v Filters:%d [%s] TotalDB:%v TotalEvents:%d (parallel)", 
 		id, totalTime, len(filters), filterInfo, totalDbTime, totalEvents)
