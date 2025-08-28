@@ -622,14 +622,15 @@ func (s *Server) doReq(ctx context.Context, ws *WebSocket, request []json.RawMes
 	}
 
 	// 并行查询结果结构
-	type filterResult struct {
-		idx         int
-		events      <-chan *nostr.Event
-		err         error
-		filterTime  time.Duration
-		dbQueryTime time.Duration
-		eventCount  int
-	}
+    type filterResult struct {
+        idx         int
+        events      <-chan *nostr.Event
+        err         error
+        filterTime  time.Duration
+        dbQueryTime time.Duration
+        eventCount  int
+        cancel      context.CancelFunc
+    }
 
 	// 启动并行查询
 	var wg sync.WaitGroup
@@ -664,7 +665,6 @@ func (s *Server) doReq(ctx context.Context, ws *WebSocket, request []json.RawMes
 			}
 			
 			qctx, qcancel := context.WithTimeout(reqCtx, filterTimeout)
-			defer qcancel()
 
 			dbStart := time.Now()
 			if qctx == nil {
@@ -674,6 +674,8 @@ func (s *Server) doReq(ctx context.Context, ws *WebSocket, request []json.RawMes
 			}
 
 			if (len(filter.Authors) == 0 && len(filter.Tags) == 0 && filter.Kinds == nil && filter.Since == nil && filter.Until == nil && filter.Search == "") && filter.Limit == 0 {
+				// no-op filter; ensure we release the timeout resources
+				qcancel()
 				results[idx] = filterResult{idx: idx, events: nil, err: nil}
 				return
 			}
@@ -684,6 +686,8 @@ func (s *Server) doReq(ctx context.Context, ws *WebSocket, request []json.RawMes
 				// 单 filter 超时：打断整次 REQ（不写 EOSE、不 setListener），让客户端自行重试
 				fmt.Printf("REQ filter timeout ws=%p id=%s idx=%d waited=%v db=%v\n", ws, id, idx, time.Since(acqStart), time.Since(dbStart))
 				cancel() // 取消整个 reqCtx，下面写环节会感知
+				// release the per-filter timeout context
+				qcancel()
 				results[idx] = filterResult{idx: idx, events: nil, err: err, dbQueryTime: time.Since(dbStart)}
 				return
 			}
@@ -697,6 +701,7 @@ func (s *Server) doReq(ctx context.Context, ws *WebSocket, request []json.RawMes
 				filterTime:  0, // 将在处理完事件后设置
 				dbQueryTime: dbDuration,
 				eventCount:  0, // 将在处理事件时计算
+				cancel:      qcancel,
 			}
 		}(idx, filter)
 	}
@@ -725,6 +730,7 @@ func (s *Server) doReq(ctx context.Context, ws *WebSocket, request []json.RawMes
 		if result.err != nil {
 			s.Log.Errorf("store: %v", result.err)
 			results[idx].filterTime = time.Since(eventProcessStart)
+			if result.cancel != nil { result.cancel() }
 			continue
 		}
 
@@ -766,11 +772,15 @@ func (s *Server) doReq(ctx context.Context, ws *WebSocket, request []json.RawMes
 					// **把当前 filter 的剩余 events 丢弃干净**
 					go drainEvents(result.events, 3*time.Second)
 
+					// 同时取消当前和后续 filters 的 per-filter 上下文，以尽快终止底层 DB 读取
+					if result.cancel != nil { result.cancel() }
+
 					// **把后续 filters 的 events 也丢弃干净**（它们的 channel 已经在 results 里）
 					for j := idx + 1; j < len(results); j++ {
 						if results[j].events != nil {
 							go drainEvents(results[j].events, 3*time.Second)
 						}
+						if results[j].cancel != nil { results[j].cancel() }
 					}
 
 					// 计数 -1 后退出
@@ -785,6 +795,9 @@ func (s *Server) doReq(ctx context.Context, ws *WebSocket, request []json.RawMes
 			for range result.events {
 			}
 		}
+
+		// 处理完成后，释放该 filter 的超时资源
+		if result.cancel != nil { result.cancel() }
 		
 		results[idx].eventCount = eventCount
 		results[idx].filterTime = time.Since(eventProcessStart) + result.dbQueryTime
