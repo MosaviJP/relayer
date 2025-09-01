@@ -44,7 +44,17 @@ type Auther interface {
 }
 
 type Injector interface {
-	InjectEvents() chan nostr.Event
+    InjectEvents() chan nostr.Event
+}
+
+// EventBroadcaster, if implemented by the outer relay, will be invoked
+// whenever an event is accepted so the implementation can propagate
+// the event to other relay instances (e.g., via Redis Pub/Sub).
+//
+// The relayer core only checks for this interface and calls it; it does not
+// implement any transport itself.
+type EventBroadcaster interface {
+    BroadcastEvent(*nostr.Event)
 }
 
 // Informationer is called to compose NIP-11 response to an HTTP request

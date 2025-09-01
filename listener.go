@@ -20,6 +20,12 @@ var (
 	closingWS      = make(map[*WebSocket]struct{})
 )
 
+type removalReason int
+const (
+    reasonDisconnect removalReason = iota
+    reasonWriteFail
+)
+
 func GetListeningFilters() nostr.Filters {
 	respfilters := make(nostr.Filters, 0, len(listeners)*2)
 
@@ -113,7 +119,7 @@ func removeListenerId(ws *WebSocket, id string) {
 }
 
 // Remove WebSocket conn from listeners
-func removeListener(ws *WebSocket) int {
+func removeListener(ws *WebSocket, reason removalReason) int {
 	var removedCount int
 
 	listenersMutex.Lock()
@@ -128,8 +134,13 @@ func removeListener(ws *WebSocket) int {
 	listenersMutex.Unlock()
 	
 	if removedCount > 0 {
-		// METRICS
-		atomic.AddInt64(&metricRemovedDisconnect, int64(removedCount))
+		// METRICS（按原因归因，只加一次）
+        switch reason {
+        case reasonDisconnect:
+            atomic.AddInt64(&metricRemovedDisconnect, int64(removedCount))
+        case reasonWriteFail:
+            atomic.AddInt64(&metricRemovedWriteFail, int64(removedCount))
+        }
 		atomic.AddInt64(&activeListeners, -int64(removedCount))
 	}
 
@@ -174,11 +185,10 @@ func notifyListeners(event *nostr.Event) {
 			errorCount++
 			brokenConnections = append(brokenConnections, target.ws)
 			fmt.Printf("notifyListeners error for listener %s: %v\n", target.id, err)
-			// EventEnvelope发送失败，减少活跃计数
-			atomic.AddInt64(&activeEventEnvelopes, -1)
-		} else {
-			notifyCount++
-		}
+			} else {
+				notifyCount++
+			}
+		atomic.AddInt64(&activeEventEnvelopes, -1)
 	}
 	atomic.StoreInt64(&allListeners, int64(listenersCount))
 	
@@ -190,10 +200,8 @@ func notifyListeners(event *nostr.Event) {
 			listenersMutex.Lock()
 			closingWS[deadWS] = struct{}{}
 			listenersMutex.Unlock()
-			removedCount := removeListener(deadWS)
+			removedCount := removeListener(deadWS, reasonWriteFail)
 			if removedCount > 0 {
-				// 归因到“写失败”而非“断连”
-				atomic.AddInt64(&metricRemovedWriteFail, int64(removedCount))
 				fmt.Printf("removed %d listeners for dead connection ws=%p\n", removedCount, deadWS)
 			}
 		}

@@ -6,11 +6,14 @@ import (
 	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"log"
 	"net/http"
+	"os"
 	"runtime"
 	"sort"
+	"strconv"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -206,23 +209,29 @@ func (s *Server) StartResourceMonitoring() {
 
 				// 可选：受控清孤儿（把历史存量清掉，方便观察新的竞态是否还发生）
 				if orphanWS > 0 {
-					cleanedWS := 0
-					cleanedSubs := 0
+					// 先收集需要清理的 ws（持锁），再在锁外统一 removeListener
+					stales := make([]*WebSocket, 0, orphanWS)
 					listenersMutex.Lock()
 					for ws, subs := range listeners {
 						if _, ok := activeConns[ws.conn]; !ok {
-							cleanedSubs += len(subs)
-							delete(listeners, ws)
-							delete(closingWS, ws)
-							cleanedWS++
+							_ = subs // 仅用于遍历
+							stales = append(stales, ws)
 						}
 					}
 					listenersMutex.Unlock()
-					if cleanedSubs > 0 {
-						atomic.AddInt64(&metricRemovedDisconnect, int64(cleanedSubs))
-						atomic.AddInt64(&activeListeners, -int64(cleanedSubs))
+
+					cleanedWS, cleanedSubs := 0, 0
+					for _, ws := range stales {
+						// 这里 removeListener 自带加锁/解锁、删除 closingWS、指标归因（reasonDisconnect）
+						removed := removeListener(ws, reasonDisconnect)
+						if removed > 0 {
+							cleanedWS++
+							cleanedSubs += removed
+						}
 					}
-					log.Printf("NOSTR_ORPHANS_CLEANED removed_ws=%d removed_subs=%d\n", cleanedWS, cleanedSubs)
+					if cleanedSubs > 0 {
+						log.Printf("NOSTR_ORPHANS_CLEANED removed_ws=%d removed_subs=%d\n", cleanedWS, cleanedSubs)
+					}
 				}
 				if orphanWS > 0 {
 					sample := 0
@@ -691,6 +700,17 @@ func (s *Server) doCount(ctx context.Context, ws *WebSocket, request []json.RawM
 }
 
 func (s *Server) doReq(ctx context.Context, ws *WebSocket, request []json.RawMessage, store eventstore.Store) string {
+
+	reqCtx, cancel := context.WithCancel(ctx)
+	defer cancel()
+	
+	filterTimeout := 8 * time.Second
+	if v := os.Getenv("RELAY_DB_FILTER_TIMEOUT"); v != "" {
+		if n, err := strconv.Atoi(v); err == nil && n > 0 {
+			filterTimeout = time.Duration(n) * time.Second
+		}
+	}
+
 	startTime := time.Now()
 	
 	// 活跃goroutine计数
@@ -734,15 +754,31 @@ func (s *Server) doReq(ctx context.Context, ws *WebSocket, request []json.RawMes
 		}
 	}
 
-	// 并行查询结果结构
-	type filterResult struct {
-		idx         int
-		events      <-chan *nostr.Event
-		err         error
-		filterTime  time.Duration
-		dbQueryTime time.Duration
-		eventCount  int
+	listenersMutex.Lock()
+	_, closing := closingWS[ws]
+	listenersMutex.Unlock()
+
+	s.clientsMu.Lock()
+	_, alive := s.clients[ws.conn]
+	s.clientsMu.Unlock()
+
+	if closing || !alive {
+		atomic.AddInt64(&metricReqDroppedOnClosed, 1)
+		fmt.Printf("NOSTR_REQ_DROP ws=%p id=%s reason=%s\n", ws, id,
+			map[bool]string{true: "closing", false: "conn-not-in-clients"}[closing])
+		return ""
 	}
+
+	// 并行查询结果结构
+    type filterResult struct {
+        idx         int
+        events      <-chan *nostr.Event
+        err         error
+        filterTime  time.Duration
+        dbQueryTime time.Duration
+        eventCount  int
+        cancel      context.CancelFunc
+    }
 
 	// 启动并行查询
 	var wg sync.WaitGroup
@@ -765,13 +801,45 @@ func (s *Server) doReq(ctx context.Context, ws *WebSocket, request []json.RawMes
 		go func(idx int, filter nostr.Filter) {
 			defer wg.Done()
 			
-			dbStart := time.Now()
-			if ctx == nil {
-				fmt.Printf("doReq: context is nil for filter %d\n", idx)
-			} else if ctx.Err() != nil {
-				fmt.Printf("doReq: context error for filter %d: %v\n", idx, ctx.Err())
+			acqStart := time.Now()
+			if s.dbSem != nil {
+				select {
+					case s.dbSem <- struct{}{}:
+					case <-reqCtx.Done():
+						results[idx] = filterResult{idx: idx, events: nil, err: reqCtx.Err()}
+						return
+				}
+				defer func() {<-s.dbSem}()
 			}
-			events, err := store.QueryEvents(ctx, filter)
+			
+			qctx, qcancel := context.WithTimeout(reqCtx, filterTimeout)
+
+			dbStart := time.Now()
+			if qctx == nil {
+				fmt.Printf("doReq: context is nil for filter %d\n", idx)
+			} else if qctx.Err() != nil {
+				fmt.Printf("doReq: context error for filter %d: %v\n", idx, qctx.Err())
+			}
+
+			if (len(filter.Authors) == 0 && len(filter.Tags) == 0 && filter.Kinds == nil && filter.Since == nil && filter.Until == nil && filter.Search == "") && filter.Limit == 0 {
+				// no-op filter; ensure we release the timeout resources
+				qcancel()
+				results[idx] = filterResult{idx: idx, events: nil, err: nil}
+				return
+			}
+
+			// 发起查询
+			events, err := store.QueryEvents(qctx, filter)
+			if err != nil && errors.Is(err, context.DeadlineExceeded) {
+				// 单 filter 超时：打断整次 REQ（不写 EOSE、不 setListener），让客户端自行重试
+				fmt.Printf("REQ filter timeout ws=%p id=%s idx=%d waited=%v db=%v\n", ws, id, idx, time.Since(acqStart), time.Since(dbStart))
+				cancel() // 取消整个 reqCtx，下面写环节会感知
+				// release the per-filter timeout context
+				qcancel()
+				results[idx] = filterResult{idx: idx, events: nil, err: err, dbQueryTime: time.Since(dbStart)}
+				return
+			}
+
 			dbDuration := time.Since(dbStart)
 			
 			results[idx] = filterResult{
@@ -781,6 +849,7 @@ func (s *Server) doReq(ctx context.Context, ws *WebSocket, request []json.RawMes
 				filterTime:  0, // 将在处理完事件后设置
 				dbQueryTime: dbDuration,
 				eventCount:  0, // 将在处理事件时计算
+				cancel:      qcancel,
 			}
 		}(idx, filter)
 	}
@@ -799,9 +868,17 @@ func (s *Server) doReq(ctx context.Context, ws *WebSocket, request []json.RawMes
 
 		eventProcessStart := time.Now()
 		
+		// 如果上面已经因为某个 filter 超时/取消了整个 reqCtx，这里直接退出
+		select {
+		case <-reqCtx.Done():
+			return ""
+		default:
+		}
+
 		if result.err != nil {
 			s.Log.Errorf("store: %v", result.err)
 			results[idx].filterTime = time.Since(eventProcessStart)
+			if result.cancel != nil { result.cancel() }
 			continue
 		}
 
@@ -821,10 +898,45 @@ func (s *Server) doReq(ctx context.Context, ws *WebSocket, request []json.RawMes
 				if eventCount >= filter.Limit {
 					break
 				}
-				// 监控：EventEnvelope创建计数（只计活跃的）
+				// 再次检查是否已经超时/取消
+				select {
+				case <-reqCtx.Done():
+					return ""
+				default:
+				}
+				// 活跃计数 +1
 				atomic.AddInt64(&activeEventEnvelopes, 1)
-				
-				ws.WriteJSON(nostr.EventEnvelope{SubscriptionID: &id, Event: *event})
+				if err := ws.WriteJSON(nostr.EventEnvelope{SubscriptionID: &id, Event: *event}); err != nil {
+					// 标记 closing
+					listenersMutex.Lock()
+					if _, ok := closingWS[ws]; !ok {
+						closingWS[ws] = struct{}{}
+						fmt.Printf("NOSTR_WS_MARK_CLOSING ws=%p conn=%p reason=history_write_err:%v\n", ws, ws.conn, err)
+					}
+					listenersMutex.Unlock()
+
+					// **立刻取消本次 REQ 的 ctx**
+					cancel()
+
+					// **把当前 filter 的剩余 events 丢弃干净**
+					go drainEvents(result.events, 3*time.Second)
+
+					// 同时取消当前和后续 filters 的 per-filter 上下文，以尽快终止底层 DB 读取
+					if result.cancel != nil { result.cancel() }
+
+					// **把后续 filters 的 events 也丢弃干净**（它们的 channel 已经在 results 里）
+					for j := idx + 1; j < len(results); j++ {
+						if results[j].events != nil {
+							go drainEvents(results[j].events, 3*time.Second)
+						}
+						if results[j].cancel != nil { results[j].cancel() }
+					}
+
+					// 计数 -1 后退出
+					atomic.AddInt64(&activeEventEnvelopes, -1)
+					return ""
+				}
+				atomic.AddInt64(&activeEventEnvelopes, -1)
 				eventCount++
 			}
 
@@ -832,6 +944,9 @@ func (s *Server) doReq(ctx context.Context, ws *WebSocket, request []json.RawMes
 			for range result.events {
 			}
 		}
+
+		// 处理完成后，释放该 filter 的超时资源
+		if result.cancel != nil { result.cancel() }
 		
 		results[idx].eventCount = eventCount
 		results[idx].filterTime = time.Since(eventProcessStart) + result.dbQueryTime
@@ -851,26 +966,65 @@ func (s *Server) doReq(ctx context.Context, ws *WebSocket, request []json.RawMes
 			filterInfo += fmt.Sprintf("F%d:%v(db:%v,events:%d)", i, result.filterTime, result.dbQueryTime, result.eventCount)
 		}
 	}
-	
+	// 如果是因为某个 filter 超时/取消导致整个 reqCtx 结束，则不写 EOSE / 不 setListener
+	select {
+	case <-reqCtx.Done():
+		return ""
+	default:
+	}
+
 	// 单行打印时间统计
 	s.Log.Infof("REQ %s timing: Total:%v Filters:%d [%s] TotalDB:%v TotalEvents:%d (parallel)", 
 		id, totalTime, len(filters), filterInfo, totalDbTime, totalEvents)
 
-	ws.WriteJSON(nostr.EOSEEnvelope(id))
+	if err := ws.WriteJSON(nostr.EOSEEnvelope(id)); err != nil {
+		// EOSE 写失败，直接标记并退出，绝不 setListener
+		listenersMutex.Lock()
+		if _, ok := closingWS[ws]; !ok {
+			closingWS[ws] = struct{}{}
+			fmt.Printf("NOSTR_WS_MARK_CLOSING ws=%p conn=%p reason=eose_write_err:%v\n", ws, ws.conn, err)
+		}
+		listenersMutex.Unlock()
+		return ""
+	}
+
+	// 双保险：1) 关闭闸门  2) conn 仍在 s.clients
 	listenersMutex.Lock()
-	_, closing := closingWS[ws]
+	_, closing = closingWS[ws]
 	listenersMutex.Unlock()
-	if closing {
+
+	s.clientsMu.Lock()
+	_, alive = s.clients[ws.conn]
+	s.clientsMu.Unlock()
+
+	if closing || !alive {
 		atomic.AddInt64(&metricReqDroppedOnClosed, 1)
-		fmt.Printf("NOSTR_REQ_DROP ws=%p id=%s reason=closing-before-eose\n", ws, id)
+		fmt.Printf("NOSTR_REQ_DROP ws=%p id=%s reason=%s\n", ws, id,
+			map[bool]string{true: "closing", false: "conn-not-in-clients"}[closing])
 		return ""
 	}
 	setListener(id, ws, filters)
 	
-	// JSON操作监控 - 减少活跃操作计数（doReq结束时）
-	atomic.AddInt64(&activeJSONOperations, -1)
-	
 	return ""
+}
+
+// 丢弃并尽快排空一个事件通道，最多等 maxDur（避免卡死）
+func drainEvents(ch <-chan *nostr.Event, maxDur time.Duration) {
+    if ch == nil {
+        return
+    }
+    deadline := time.NewTimer(maxDur)
+    defer deadline.Stop()
+    for {
+        select {
+        case _, ok := <-ch:
+            if !ok {
+                return // 正常关闭
+            }
+        case <-deadline.C:
+            return // 到时放弃
+        }
+    }
 }
 
 func (s *Server) doClose(ctx context.Context, ws *WebSocket, request []json.RawMessage, store eventstore.Store) string {
@@ -1297,7 +1451,7 @@ func (s *Server) HandleWebsocket(w http.ResponseWriter, r *http.Request) {
 				atomic.AddInt64(&activeWebSocketConnections, -1)
 			}
 			s.clientsMu.Unlock()
-			removed := removeListener(ws)
+			removed := removeListener(ws, reasonDisconnect)
 			if removed > 0 {
 				s.Log.Infof("ws=%p removed_subs=%d (reader)", ws, removed)
 			}
@@ -1364,7 +1518,7 @@ func (s *Server) HandleWebsocket(w http.ResponseWriter, r *http.Request) {
 			cancel()
 			ticker.Stop()
 			conn.Close()
-			removed := removeListener(ws)
+			removed := removeListener(ws, reasonDisconnect)
 			if removed > 0 {
 				s.Log.Infof("ws=%p removed_subs=%d (writer)", ws, removed)
 			}
