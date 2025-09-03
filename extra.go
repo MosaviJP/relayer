@@ -14,3 +14,20 @@ func GetAuthStatus(ctx context.Context) (pubkey string, ok bool) {
 	}
 	return "", false
 }
+
+// GetConnPubkey returns a pubkey associated with this connection, preferring
+// authenticated pubkey (NIP-42). If not authenticated, it falls back to the
+// optional "pubkey" provided via request header and stored in context.
+func GetConnPubkey(ctx context.Context, ws *WebSocket) string {
+	if ws != nil && ws.authed != "" {
+		return ws.authed
+	}
+	if ctx != nil {
+		if v := ctx.Value("userPubkey"); v != nil {
+			if s, ok := v.(string); ok && s != "" {
+				return s
+			}
+		}
+	}
+	return ""
+}

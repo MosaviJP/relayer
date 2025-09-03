@@ -1375,6 +1375,7 @@ func (s *Server) handleMessage(ctx context.Context, ws *WebSocket, message []byt
 	case "REQ":
 		notice = s.doReq(ctx, ws, request, store)
 	case "CLOSE":
+		fmt.Printf("CLOSE %s from [%s]\n", string(message), GetConnPubkey(ctx, ws))
 		notice = s.doClose(ctx, ws, request, store)
 	case "AUTH":
 		notice = s.doAuth(ctx, ws, request, store)
@@ -1455,7 +1456,7 @@ func (s *Server) HandleWebsocket(w http.ResponseWriter, r *http.Request) {
 			if removed > 0 {
 				s.Log.Infof("ws=%p removed_subs=%d (reader)", ws, removed)
 			}
-			s.Log.Infof("disconnected from %s", ip)
+			s.Log.Infof("disconnected from %s from [%s]", ip, GetConnPubkey(ctx, ws))
 		}()
 
 		conn.SetReadLimit(maxMessageSize)
