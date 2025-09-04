@@ -343,15 +343,24 @@ func (s *Server) doEvent(ctx context.Context, ws *WebSocket, request []json.RawM
 		defer func() {
 			if txErr != nil {
 				tx.Rollback()
+				// drop queued broadcasts for this tx since it's rolled back
+				discardPostCommitBroadcast(tx)
 			} else {
 				if commitErr := tx.Commit(); commitErr != nil {
 					s.Log.Errorf("failed to commit transaction for event %s: %v", evt.ID, commitErr)
+					// avoid leaking queued events if commit fails
+					discardPostCommitBroadcast(tx)
+				} else {
+					// flush any queued post-commit broadcasts
+					flushPostCommitBroadcast(tx, s.relay)
 				}
 			}
 		}()
 
 		// Add transaction to context
 		ctxWithTx := eventstore.WithTx(ctx, tx)
+		// Accumulate non-fatal warnings to return in OK reason
+		okReason := ""
 
 		// Save event in same transaction
 		ok, reason := AddEvent(ctxWithTx, s.relay, &evt)
@@ -369,13 +378,22 @@ func (s *Server) doEvent(ctx context.Context, ws *WebSocket, request []json.RawM
 				ws.WriteJSON(nostr.OKEnvelope{EventID: evt.ID, OK: false, Reason: "failed to handle disappearing message"})
 				return ""
 			}
-		} else if evt.Kind == 3046 || evt.Kind == 3047 {
-			// Handle group management events (3046: newGen, 3047: join)
+		} else if evt.Kind == 3046 || evt.Kind == 3047 || evt.Kind == 20041 || evt.Kind == 20042 || evt.Kind == 39304 {
+			// Handle group management events (3046: newGen, 3047: join, 20041: shareable, 20042: approval, 39304: alias)
 			if err := s.handleGroupManagementEventInline(ctxWithTx, &evt); err != nil {
-				txErr = fmt.Errorf("failed to handle group management event: %w", err)
-				s.Log.Errorf("failed to handle group management event %s: %v", evt.ID, err)
-				ws.WriteJSON(nostr.OKEnvelope{EventID: evt.ID, OK: false, Reason: "failed to handle group management"})
-				return ""
+				// Skip non-fatal cases: missing bot key or unsupported backend
+				if errors.Is(err, errBotKeyNotConfigured) || errors.Is(err, errUnsupportedGroupMgmtBackend) {
+					if okReason == "" {
+						okReason = "group management skipped: " + err.Error()
+					} else {
+						okReason += "; group management skipped: " + err.Error()
+					}
+				} else {
+					txErr = fmt.Errorf("failed to handle group management event: %w", err)
+					s.Log.Errorf("failed to handle group management event %s: %v", evt.ID, err)
+					ws.WriteJSON(nostr.OKEnvelope{EventID: evt.ID, OK: false, Reason: "failed to handle group management"})
+					return ""
+				}
 			}
 		} else if evt.Kind == 5 {
 			// event deletion -- nip09
@@ -429,7 +447,7 @@ func (s *Server) doEvent(ctx context.Context, ws *WebSocket, request []json.RawM
 		}
 
 		// If we reach here, all operations succeeded
-		ws.WriteJSON(nostr.OKEnvelope{EventID: evt.ID, OK: true})
+		ws.WriteJSON(nostr.OKEnvelope{EventID: evt.ID, OK: true, Reason: okReason})
 		// txErr remains nil, so defer will commit the transaction
 		return ""
 	}
@@ -496,6 +514,15 @@ func (s *Server) doEvent(ctx context.Context, ws *WebSocket, request []json.RawM
 	}
 
 	ok, reason := AddEvent(ctx, s.relay, &evt)
+	// Add non-fatal hint if this is a group management event but backend/config not supporting inline handling
+	if ok && (evt.Kind == 3046 || evt.Kind == 3047 || evt.Kind == 20041 || evt.Kind == 20042 || evt.Kind == 39304) {
+		// backend here is non-PostgreSQL
+		if reason == "" {
+			reason = "group management skipped: unsupported backend"
+		} else {
+			reason += "; group management skipped: unsupported backend"
+		}
+	}
 	ws.WriteJSON(nostr.OKEnvelope{EventID: evt.ID, OK: ok, Reason: reason})
 	return ""
 }
@@ -576,7 +603,7 @@ func (s *Server) doEvents(
 		if isDisappearingMessage(evt) {
 			disappearingEvents = append(disappearingEvents, evt)
 		}
-		if evt.Kind == 3046 || evt.Kind == 3047 {
+		if evt.Kind == 3046 || evt.Kind == 3047 || evt.Kind == 20041 || evt.Kind == 20042 || evt.Kind == 39304 {
 			groupManagementEvents = append(groupManagementEvents, evt)
 		}
     }
@@ -599,9 +626,14 @@ func (s *Server) doEvents(
 		defer func() {
 			if txErr != nil {
 				tx.Rollback()
+				discardPostCommitBroadcast(tx)
 			} else {
 				if commitErr := tx.Commit(); commitErr != nil {
 					s.Log.Errorf("doEvents: failed to commit transaction: %v", commitErr)
+					discardPostCommitBroadcast(tx)
+				} else {
+					// flush any queued post-commit broadcasts
+					flushPostCommitBroadcast(tx, s.relay)
 				}
 			}
 		}()
@@ -609,7 +641,20 @@ func (s *Server) doEvents(
 		// Add transaction to context
 		ctxWithTx := eventstore.WithTx(ctx, tx)
 
-		// Handle disappearing messages in transaction if any
+		// Save events in same transaction (first)
+		accepted, reason := AddEvents(ctxWithTx, s.relay, events)
+		if !accepted {
+			txErr = fmt.Errorf("batch failed: %s", reason)
+			s.Log.Infof("doEvents: batch failed: %s", reason)
+			ws.WriteJSON(nostr.OKEnvelope{
+				EventID: "",
+				OK:      false,
+				Reason:  fmt.Sprintf("batch failed: %s", reason),
+			})
+			return ""
+		}
+
+		// Then handle disappearing messages in transaction if any
 		if len(disappearingEvents) > 0 {
 			err = s.handleDisappearingMessageList(ctxWithTx, disappearingEvents)
 			if err != nil {
@@ -624,39 +669,40 @@ func (s *Server) doEvents(
 			}
 		}
 
-		// Handle group management events in transaction if any
+		// Then handle group management events in transaction if any (skip non-fatal cases)
+		okReason := ""
 		if len(groupManagementEvents) > 0 {
-			for _, evt := range groupManagementEvents {
-				if err := s.handleGroupManagementEventInline(ctxWithTx, &evt); err != nil {
-					txErr = fmt.Errorf("failed to handle group management event %s: %w", evt.ID, err)
-					s.Log.Errorf("doEvents: failed to handle group management event %s: %v", evt.ID, err)
-					ws.WriteJSON(nostr.OKEnvelope{
-						EventID: evt.ID,
-						OK:      false,
-						Reason:  "failed to handle group management events",
-					})
-					return ""
+			// Process in stable priority order so admin setup (3046) precedes policy/events
+			kindOrder := []int{3046, 3047, 20041, 20042, 39304}
+			for _, k := range kindOrder {
+				for _, evt := range groupManagementEvents {
+					if evt.Kind != k { continue }
+					if err := s.handleGroupManagementEventInline(ctxWithTx, &evt); err != nil {
+						if errors.Is(err, errBotKeyNotConfigured) || errors.Is(err, errUnsupportedGroupMgmtBackend) {
+							if okReason == "" {
+								okReason = "group management skipped: " + err.Error()
+							} else {
+								okReason += "; group management skipped: " + err.Error()
+							}
+							continue
+						}
+						txErr = fmt.Errorf("failed to handle group management event %s: %w", evt.ID, err)
+						s.Log.Errorf("doEvents: failed to handle group management event %s: %v", evt.ID, err)
+						ws.WriteJSON(nostr.OKEnvelope{
+							EventID: evt.ID,
+							OK:      false,
+							Reason:  "failed to handle group management events",
+						})
+						return ""
+					}
 				}
 			}
-		}
-
-		// Save events in same transaction
-		accepted, reason := AddEvents(ctxWithTx, s.relay, events)
-		if !accepted {
-			txErr = fmt.Errorf("batch failed: %s", reason)
-			s.Log.Infof("doEvents: batch failed: %s", reason)
-			ws.WriteJSON(nostr.OKEnvelope{
-				EventID: "",
-				OK:      false,
-				Reason:  fmt.Sprintf("batch failed: %s", reason),
-			})
-			return ""
 		}
 
 		// If we reach here, all operations succeeded
 		// Send success responses for all events
 		for _, evt := range events {
-			ws.WriteJSON(nostr.OKEnvelope{EventID: evt.ID, OK: true})
+			ws.WriteJSON(nostr.OKEnvelope{EventID: evt.ID, OK: true, Reason: okReason})
 		}
 
 		ws.WriteJSON(nostr.OKEnvelope{
@@ -679,6 +725,17 @@ func (s *Server) doEvents(
 	// No transaction support - use original logic
 	accepted, reason := AddEvents(ctx, s.relay, events)
 
+	// Prepare non-fatal hint for special kinds
+	okHint := ""
+	if len(groupManagementEvents) > 0 {
+		okHint = "group management skipped: unsupported backend"
+		if configProvider, ok := s.relay.(interface{ GetGroupManagementConfig() string }); ok {
+			if configProvider.GetGroupManagementConfig() == "" {
+				okHint += "; missing bot private key"
+			}
+		}
+	}
+
     for _, evt := range events {
         if !accepted{
             ws.WriteJSON(nostr.OKEnvelope{
@@ -687,8 +744,12 @@ func (s *Server) doEvents(
                 Reason:  fmt.Sprintf("failed to add event: %s", reason),
             })
         } else {
-			ws.WriteJSON(nostr.OKEnvelope{EventID: evt.ID, OK: true})
-		}
+            if (evt.Kind == 3046 || evt.Kind == 3047 || evt.Kind == 20041 || evt.Kind == 20042 || evt.Kind == 39304) && okHint != "" {
+                ws.WriteJSON(nostr.OKEnvelope{EventID: evt.ID, OK: true, Reason: okHint})
+            } else {
+                ws.WriteJSON(nostr.OKEnvelope{EventID: evt.ID, OK: true})
+            }
+        }
     }
 	
 	if !accepted {

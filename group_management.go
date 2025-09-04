@@ -5,8 +5,12 @@ import (
 	"database/sql"
 	"encoding/json"
 	"fmt"
+	"os"
+	"regexp"
 	"strings"
 	"time"
+
+	"sync"
 
 	"github.com/MosaviJP/eventstore"
 	"github.com/MosaviJP/eventstore/postgresql"
@@ -81,6 +85,217 @@ type MemberAdditionRequest struct {
 	CreatedAt    int64      `json:"createdAt"`
 }
 
+// IsShareableRequest represents the structure for 20041 events
+type IsShareableRequest struct {
+	GroupID     string `json:"groupId"`
+	IsShareable bool   `json:"shareable"`
+}
+
+// JoinApprovalRequest represents the structure for 20042 events
+type JoinApprovalRequest struct {
+	GroupID               string `json:"groupId"`
+	IsJoinApprovalRequired bool   `json:"review"`
+}
+
+// AliasRequest represents the structure for 39304 events
+type AliasRequest struct {
+	GroupID string `json:"groupId"`
+	Alias   string `json:"alias"`
+}
+
+// GroupApprovalData represents the data structure for group approval status
+type GroupApprovalData struct {
+	GroupID               string    `json:"group_id" db:"group_id"`
+	IsJoinApprovalRequired bool      `json:"is_join_approval_required" db:"is_join_approval_required"`
+	CreatedAt             time.Time `json:"created_at" db:"created_at"`
+	UpdatedAt             time.Time `json:"updated_at" db:"updated_at"`
+}
+
+// MemberAliasData represents the data structure for member aliases
+type MemberAliasData struct {
+	GroupID      string    `json:"group_id" db:"group_id"`
+	MemberPubkey string    `json:"member_pubkey" db:"member_pubkey"`
+	Alias        string    `json:"alias" db:"alias"`
+	CreatedAt    time.Time `json:"created_at" db:"created_at"`
+}
+
+// Sentinel errors to signal non-fatal skips for group management handling
+var (
+	errBotKeyNotConfigured         = fmt.Errorf("bot private key not configured")
+	errUnsupportedGroupMgmtBackend = fmt.Errorf("group management requires PostgreSQL backend")
+)
+
+// optional schema provider interface; if implemented by relay, used to fetch schema
+type GroupSchemaProvider interface {
+    GetGroupManagementSchema() string
+}
+
+var schemaNameRe = regexp.MustCompile(`^[a-zA-Z_][a-zA-Z0-9_]*$`)
+
+// getGroupSchema resolves schema for group management tables.
+// Priority: relay provider -> env GROUP_MGMT_SCHEMA -> env RELAY_GROUP_SCHEMA -> "moss_api"
+func (s *Server) getGroupSchema() string {
+	if p, ok := s.relay.(GroupSchemaProvider); ok {
+		if name := p.GetGroupManagementSchema(); schemaNameRe.MatchString(name) {
+			return name
+		} else if name != "" {
+			s.Log.Warningf("invalid schema from provider: %q; fallback to default", name)
+		}
+	}
+	if env := os.Getenv("GROUP_MGMT_SCHEMA"); env != "" {
+		if schemaNameRe.MatchString(env) { return env }
+		s.Log.Warningf("invalid GROUP_MGMT_SCHEMA=%q; fallback to default", env)
+	}
+	if env := os.Getenv("RELAY_GROUP_SCHEMA"); env != "" {
+		if schemaNameRe.MatchString(env) { return env }
+		s.Log.Warningf("invalid RELAY_GROUP_SCHEMA=%q; fallback to default", env)
+	}
+	return "moss_api"
+}
+
+// ---- Permission helpers ----
+
+// groupHasAnyAdmin returns true if the group has any admin key records
+func (s *Server) groupHasAnyAdmin(ctx context.Context, backend *postgresql.PostgresBackend, groupID string) (bool, error) {
+	schema := s.getGroupSchema()
+	query := fmt.Sprintf(`SELECT 1 FROM %s.admin_keys WHERE group_id = $1 LIMIT 1`, schema)
+	if tx, ok := eventstore.TxFrom(ctx); ok {
+		var x int
+		err := tx.QueryRowContext(ctx, query, groupID).Scan(&x)
+		if err == sql.ErrNoRows { return false, nil }
+		if err != nil { return false, err }
+		return true, nil
+	}
+	var x int
+	err := backend.DB.QueryRowContext(ctx, query, groupID).Scan(&x)
+	if err == sql.ErrNoRows { return false, nil }
+	if err != nil { return false, err }
+	return true, nil
+}
+
+// isOwner returns true if pubkey is an owner for the group
+func (s *Server) isOwner(ctx context.Context, backend *postgresql.PostgresBackend, groupID, pubkey string) (bool, error) {
+	schema := s.getGroupSchema()
+	query := fmt.Sprintf(`SELECT 1 FROM %s.admin_keys WHERE group_id = $1 AND owner_pubkey = $2 LIMIT 1`, schema)
+	if tx, ok := eventstore.TxFrom(ctx); ok {
+		var x int
+		err := tx.QueryRowContext(ctx, query, groupID, pubkey).Scan(&x)
+		if err == sql.ErrNoRows { return false, nil }
+		if err != nil { return false, err }
+		return true, nil
+	}
+	var x int
+	err := backend.DB.QueryRowContext(ctx, query, groupID, pubkey).Scan(&x)
+	if err == sql.ErrNoRows { return false, nil }
+	if err != nil { return false, err }
+	return true, nil
+}
+
+// isAdmin returns true if pubkey is an admin (has admin key with latest=true)
+func (s *Server) isAdmin(ctx context.Context, backend *postgresql.PostgresBackend, groupID, pubkey string) (bool, error) {
+	schema := s.getGroupSchema()
+	query := fmt.Sprintf(`SELECT 1 FROM %s.admin_keys WHERE group_id = $1 AND user_pubkey = $2 AND latest = true LIMIT 1`, schema)
+	if tx, ok := eventstore.TxFrom(ctx); ok {
+		var x int
+		err := tx.QueryRowContext(ctx, query, groupID, pubkey).Scan(&x)
+		if err == sql.ErrNoRows { return false, nil }
+		if err != nil { return false, err }
+		return true, nil
+	}
+	var x int
+	err := backend.DB.QueryRowContext(ctx, query, groupID, pubkey).Scan(&x)
+	if err == sql.ErrNoRows { return false, nil }
+	if err != nil { return false, err }
+	return true, nil
+}
+
+// isMember returns true if pubkey is a current member of the group
+func (s *Server) isMember(ctx context.Context, backend *postgresql.PostgresBackend, groupID, pubkey string) (bool, error) {
+	schema := s.getGroupSchema()
+	query := fmt.Sprintf(`SELECT 1 FROM %s.group_memberships WHERE group_id = $1 AND member_pubkey = $2 AND latest = true LIMIT 1`, schema)
+	if tx, ok := eventstore.TxFrom(ctx); ok {
+		var x int
+		err := tx.QueryRowContext(ctx, query, groupID, pubkey).Scan(&x)
+		if err == sql.ErrNoRows { return false, nil }
+		if err != nil { return false, err }
+		return true, nil
+	}
+	var x int
+	err := backend.DB.QueryRowContext(ctx, query, groupID, pubkey).Scan(&x)
+	if err == sql.ErrNoRows { return false, nil }
+	if err != nil { return false, err }
+	return true, nil
+}
+
+// isJoinApprovalRequired returns whether the group currently requires join approval.
+// If no record exists, defaults to false (no approval required).
+func (s *Server) isJoinApprovalRequired(ctx context.Context, backend *postgresql.PostgresBackend, groupID string) (bool, error) {
+	schema := s.getGroupSchema()
+	query := fmt.Sprintf(`SELECT is_join_approval_required FROM %s.group_approval_status WHERE group_id = $1 LIMIT 1`, schema)
+	var required bool
+	if tx, ok := eventstore.TxFrom(ctx); ok {
+		err := tx.QueryRowContext(ctx, query, groupID).Scan(&required)
+		if err == sql.ErrNoRows { return false, nil }
+		if err != nil { return false, err }
+		return required, nil
+	}
+	err := backend.DB.QueryRowContext(ctx, query, groupID).Scan(&required)
+	if err == sql.ErrNoRows { return false, nil }
+	if err != nil { return false, err }
+	return required, nil
+}
+
+// ---- Consolidated permission helpers ----
+
+// requireAdminOrFresh requires the sender to be admin if the group already has any admin
+func (s *Server) requireAdminOrFresh(ctx context.Context, backend *postgresql.PostgresBackend, groupID, pubkey string) error {
+	hasAdmin, err := s.groupHasAnyAdmin(ctx, backend, groupID)
+	if err != nil {
+		s.Log.Warningf("permission check (hasAdmin) failed for group %s: %v; allowing as fresh", groupID, err)
+		return nil
+	}
+	if hasAdmin {
+		ok, err := s.isAdmin(ctx, backend, groupID, pubkey)
+		if err != nil { return fmt.Errorf("permission check failed: %w", err) }
+		if !ok { return fmt.Errorf("forbidden: requires admin of group %s", groupID) }
+	}
+	return nil
+}
+
+// requireOwnerOrFresh requires the sender to be owner if the group already has any admin
+func (s *Server) requireOwnerOrFresh(ctx context.Context, backend *postgresql.PostgresBackend, groupID, pubkey string) error {
+	hasAdmin, err := s.groupHasAnyAdmin(ctx, backend, groupID)
+	if err != nil {
+		s.Log.Warningf("permission check (hasAdmin) failed for group %s: %v; allowing as fresh", groupID, err)
+		return nil
+	}
+	if hasAdmin {
+		ok, err := s.isOwner(ctx, backend, groupID, pubkey)
+		if err != nil { return fmt.Errorf("permission check failed: %w", err) }
+		if !ok { return fmt.Errorf("forbidden: requires owner of group %s", groupID) }
+	}
+	return nil
+}
+
+// requireSenderMember ensures the sender is a current member of the group
+func (s *Server) requireSenderMember(ctx context.Context, backend *postgresql.PostgresBackend, groupID, pubkey string) error {
+	ok, err := s.isMember(ctx, backend, groupID, pubkey)
+	if err != nil { return fmt.Errorf("failed to verify sender membership: %w", err) }
+	if !ok { return fmt.Errorf("forbidden: sender %s is not a member of group %s", pubkey, groupID) }
+	return nil
+}
+
+// checkJoinApprovalAllowsAdd returns error if join approval is required (forbids 3047)
+func (s *Server) checkJoinApprovalAllowsAdd(ctx context.Context, backend *postgresql.PostgresBackend, groupID string) error {
+	required, err := s.isJoinApprovalRequired(ctx, backend, groupID)
+	if err != nil {
+		s.Log.Warningf("join approval check failed for group %s: %v; treating as not required", groupID, err)
+		return nil
+	}
+	if required { return fmt.Errorf("forbidden: group %s requires join approval; cannot add members via 3047", groupID) }
+	return nil
+}
+
 // handleGroupManagementEventInline processes group management events inline
 func (s *Server) handleGroupManagementEventInline(ctx context.Context, evt *nostr.Event) error {
 	// Get bot private key from relay config
@@ -90,14 +305,14 @@ func (s *Server) handleGroupManagementEventInline(ctx context.Context, evt *nost
 	}
 
 	if botPrivateKey == "" {
-		return fmt.Errorf("bot private key not configured")
+		return errBotKeyNotConfigured
 	}
 
 	// Get the PostgreSQL backend first
 	store := s.relay.Storage(ctx)
 	postgresBackend, ok := store.(*postgresql.PostgresBackend)
 	if !ok {
-		return fmt.Errorf("group management requires PostgreSQL backend")
+		return errUnsupportedGroupMgmtBackend
 	}
 
 	// Ensure schema exists once before processing - use direct DB connection
@@ -122,8 +337,13 @@ func (s *Server) handleGroupManagementEventInline(ctx context.Context, evt *nost
 		defer func() {
 			if err != nil {
 				localTx.Rollback()
+				discardPostCommitBroadcast(localTx)
 			} else {
-				localTx.Commit()
+				if cErr := localTx.Commit(); cErr != nil {
+					discardPostCommitBroadcast(localTx)
+				} else {
+					flushPostCommitBroadcast(localTx, s.relay)
+				}
 			}
 		}()
 	}
@@ -133,6 +353,12 @@ func (s *Server) handleGroupManagementEventInline(ctx context.Context, evt *nost
 		err = s.handleSessionKeyRotationEvent(ctx, evt, botPrivateKey)
 	case 3047:
 		err = s.handleMemberAdditionEvent(ctx, evt, botPrivateKey)
+	case 20041:
+		err = s.handleIsShareableEvent(ctx, evt, botPrivateKey)
+	case 20042:
+		err = s.handleJoinApprovalEvent(ctx, evt, botPrivateKey)
+	case 39304:
+		err = s.handleAliasEvent(ctx, evt, botPrivateKey)
 	default:
 		err = fmt.Errorf("unsupported group management event kind: %d", evt.Kind)
 	}
@@ -152,7 +378,7 @@ func (s *Server) handleSessionKeyRotationEvent(ctx context.Context, evt *nostr.E
 
 	s.Log.Infof("Decrypted 3046 content: %s", decryptedContent)
 
-	// Try to determine if this is gen-key update (has members) or admin-key update (has roles)
+	// Try to determine if this is gen-key update (members>0) or admin-key update (roles>0)
 	var rawData map[string]interface{}
 	if err := json.Unmarshal([]byte(decryptedContent), &rawData); err != nil {
 		return fmt.Errorf("failed to parse 3046 raw data: %w", err)
@@ -164,15 +390,27 @@ func (s *Server) handleSessionKeyRotationEvent(ctx context.Context, evt *nostr.E
 		return fmt.Errorf("group management requires PostgreSQL backend")
 	}
 
-	if members, hasMembers := rawData["members"]; hasMembers && members != nil {
+	hasMembers := false
+	hasRoles := false
+	if v, ok := rawData["members"]; ok && v != nil {
+		if arr, ok2 := v.([]interface{}); ok2 && len(arr) > 0 { hasMembers = true }
+	}
+	if v, ok := rawData["roles"]; ok && v != nil {
+		if arr, ok2 := v.([]interface{}); ok2 && len(arr) > 0 { hasRoles = true }
+	}
+
+	if hasMembers && hasRoles {
+		return fmt.Errorf("invalid 3046 event: both members and roles present")
+	}
+	if hasMembers {
 		// This is a gen-key update (session key rotation)
 		return s.handleGenKeyUpdate(ctx, evt, decryptedContent, botPrivateKey, postgresBackend)
-	} else if roles, hasRoles := rawData["roles"]; hasRoles && roles != nil {
+	}
+	if hasRoles {
 		// This is an admin-key update
 		return s.handleAdminKeyUpdate(ctx, evt, decryptedContent, botPrivateKey, postgresBackend)
-	} else {
-		return fmt.Errorf("unknown 3046 event type: neither members nor roles found")
 	}
+	return fmt.Errorf("invalid 3046 event: neither members nor roles provided")
 }
 
 // handleGenKeyUpdate processes gen-key updates (3046 with members)
@@ -184,6 +422,9 @@ func (s *Server) handleGenKeyUpdate(ctx context.Context, evt *nostr.Event, decry
 
 	s.Log.Infof("Gen-key update for group %s, %d members updated", 
 		request.GroupID, len(request.Members))
+
+    // Permission: require admin; if fresh group (no admin yet) allow
+    if err := s.requireAdminOrFresh(ctx, backend, request.GroupID, evt.PubKey); err != nil { return err }
 
 	// Determine the admin pubkey (encryptPubkey or sender)
 	encryptKey := request.EncryptPubkey
@@ -198,7 +439,8 @@ func (s *Server) handleGenKeyUpdate(ctx context.Context, evt *nostr.Event, decry
 	}
 
 	// Query existing records for this event to avoid duplicate processing
-	existingQuery := `SELECT member_pubkey FROM moss_api.group_memberships WHERE event_id = $1 AND group_id = $2`
+	schema := s.getGroupSchema()
+	existingQuery := fmt.Sprintf(`SELECT member_pubkey FROM %s.group_memberships WHERE event_id = $1 AND group_id = $2`, schema)
 	var existingMembers []string
 	rows, err := tx.QueryContext(ctx, existingQuery, evt.ID, request.GroupID)
 	if err == nil {
@@ -276,49 +518,73 @@ func (s *Server) updateLatestFlagsForGroupMembership(ctx context.Context, backen
 		return fmt.Errorf("transaction required for latest flag updates")
 	}
 
-	// Find the current maximum created_at and gen_pubkey
-	latestQuery := `
-		SELECT created_at, gen_pubkey 
-		FROM moss_api.group_memberships 
-		WHERE group_id = $1 
-		ORDER BY created_at DESC, gen_pubkey DESC 
-		LIMIT 1
-	`
-	var maxCreatedAt int64
-	var maxGenPubkey string
-	err := tx.QueryRowContext(ctx, latestQuery, groupID).Scan(&maxCreatedAt, &maxGenPubkey)
-	if err != nil {
-		if err == sql.ErrNoRows {
-			// No records for this group, nothing to update
-			return nil
+	// Compatibility-safe implementation: compute latest purely in SQL to tolerate BIGINT/TIMESTAMPTZ
+	{
+		schema := s.getGroupSchema()
+		reset := fmt.Sprintf(`
+            UPDATE %s.group_memberships AS gm
+            SET latest = false
+            WHERE gm.group_id = $1 AND gm.latest = true AND NOT (
+                gm.created_at = (SELECT max(created_at) FROM %s.group_memberships WHERE group_id = $1)
+                AND gm.gen_pubkey = (
+                    SELECT max(gen_pubkey) FROM %s.group_memberships 
+                    WHERE group_id = $1 AND created_at = (SELECT max(created_at) FROM %s.group_memberships WHERE group_id = $1)
+                )
+            )
+        `, schema, schema, schema, schema)
+		if _, err := tx.ExecContext(ctx, reset, groupID); err != nil {
+			return fmt.Errorf("failed to reset latest flags: %w", err)
 		}
-		return fmt.Errorf("failed to query latest record: %w", err)
-	}
 
-	// Reset only the records that are currently latest=true but should not be
-	resetLatestQuery := `
-		UPDATE moss_api.group_memberships 
-		SET latest = false 
-		WHERE group_id = $1 AND latest = true 
-		AND NOT (created_at = $2 AND gen_pubkey = $3)
-	`
-	_, err = tx.ExecContext(ctx, resetLatestQuery, groupID, maxCreatedAt, maxGenPubkey)
-	if err != nil {
+        set := fmt.Sprintf(`
+            UPDATE %s.group_memberships AS gm
+            SET latest = true
+            WHERE gm.group_id = $1 AND gm.latest = false
+              AND gm.created_at = (SELECT max(created_at) FROM %s.group_memberships WHERE group_id = $1)
+              AND gm.gen_pubkey = (
+                    SELECT max(gen_pubkey) FROM %s.group_memberships 
+                    WHERE group_id = $1 AND created_at = (SELECT max(created_at) FROM %s.group_memberships WHERE group_id = $1)
+              )
+        `, schema, schema, schema, schema)
+        if _, err := tx.ExecContext(ctx, set, groupID); err != nil {
+            return fmt.Errorf("failed to set latest flags: %w", err)
+        }
+        s.Log.Infof("Updated latest flags for group %s", groupID)
+        return nil
+    }
+
+    // Reset/Set using SQL-only comparisons to tolerate BIGINT/TIMESTAMPTZ
+    schema := s.getGroupSchema()
+    reset := fmt.Sprintf(`
+        UPDATE %s.group_memberships AS gm
+        SET latest = false
+        WHERE gm.group_id = $1 AND gm.latest = true AND NOT (
+            gm.created_at = (SELECT max(created_at) FROM %s.group_memberships WHERE group_id = $1)
+            AND gm.gen_pubkey = (
+                SELECT max(gen_pubkey) FROM %s.group_memberships 
+                WHERE group_id = $1 AND created_at = (SELECT max(created_at) FROM %s.group_memberships WHERE group_id = $1)
+            )
+        )
+    `, schema, schema, schema, schema)
+	if _, err := tx.ExecContext(ctx, reset, groupID); err != nil {
 		return fmt.Errorf("failed to reset latest flags: %w", err)
 	}
 
-	// Set latest=true for records with the maximum created_at and gen_pubkey that aren't already latest
-	setLatestQuery := `
-		UPDATE moss_api.group_memberships 
-		SET latest = true 
-		WHERE group_id = $1 AND created_at = $2 AND gen_pubkey = $3 AND latest = false
-	`
-	_, err = tx.ExecContext(ctx, setLatestQuery, groupID, maxCreatedAt, maxGenPubkey)
-	if err != nil {
+	set := fmt.Sprintf(`
+        UPDATE %s.group_memberships AS gm
+        SET latest = true
+        WHERE gm.group_id = $1 AND gm.latest = false
+          AND gm.created_at = (SELECT max(created_at) FROM %s.group_memberships WHERE group_id = $1)
+          AND gm.gen_pubkey = (
+                SELECT max(gen_pubkey) FROM %s.group_memberships 
+                WHERE group_id = $1 AND created_at = (SELECT max(created_at) FROM %s.group_memberships WHERE group_id = $1)
+          )
+    `, schema, schema, schema, schema)
+	if _, err := tx.ExecContext(ctx, set, groupID); err != nil {
 		return fmt.Errorf("failed to set latest flags: %w", err)
 	}
 
-	s.Log.Infof("Updated latest flags for group %s (max created_at: %d, gen_pubkey: %s)", groupID, maxCreatedAt, maxGenPubkey)
+	s.Log.Infof("Updated latest flags for group %s", groupID)
 	return nil
 }
 
@@ -331,6 +597,17 @@ func (s *Server) handleAdminKeyUpdate(ctx context.Context, evt *nostr.Event, dec
 
 	s.Log.Infof("Admin-key update for group %s, %d roles updated", 
 		request.GroupID, len(request.Roles))
+
+	// Permission: require owner; if no admin_keys exist yet for this group, allow (fresh group creation)
+	hasAdmin, errPerm := s.groupHasAnyAdmin(ctx, backend, request.GroupID)
+	if errPerm != nil { return fmt.Errorf("permission check failed: %w", errPerm) }
+	if hasAdmin {
+		okOwner, errOwner := s.isOwner(ctx, backend, request.GroupID, evt.PubKey)
+		if errOwner != nil { return fmt.Errorf("permission check failed: %w", errOwner) }
+		if !okOwner {
+			return fmt.Errorf("forbidden: 3046(admin-keys) requires owner of group %s", request.GroupID)
+		}
+	}
 
 	// Process admin keys for all roles
 	for _, role := range request.Roles {
@@ -378,12 +655,42 @@ func (s *Server) updateLatestFlagsForAdminKeys(ctx context.Context, backend *pos
 		return fmt.Errorf("transaction required for admin key latest flag updates")
 	}
 
+	// Compatibility-safe SQL-only implementation to avoid type issues (BIGINT vs TIMESTAMPTZ)
+	{
+		schema := s.getGroupSchema()
+		reset := fmt.Sprintf(`
+            UPDATE %s.admin_keys 
+            SET latest = false 
+            WHERE group_id = $1 AND latest = true AND created_at <> (
+                SELECT max(created_at) FROM %s.admin_keys WHERE group_id = $1
+            )
+        `, schema, schema)
+		if _, err := tx.ExecContext(ctx, reset, groupID); err != nil {
+			return fmt.Errorf("failed to reset admin key latest flags: %w", err)
+		}
+
+		set := fmt.Sprintf(`
+            UPDATE %s.admin_keys 
+            SET latest = true 
+            WHERE group_id = $1 AND latest = false AND created_at = (
+                SELECT max(created_at) FROM %s.admin_keys WHERE group_id = $1
+            )
+        `, schema, schema)
+		if _, err := tx.ExecContext(ctx, set, groupID); err != nil {
+			return fmt.Errorf("failed to set admin key latest flags: %w", err)
+		}
+
+		s.Log.Infof("Updated latest flags for admin keys in group %s", groupID)
+		return nil
+	}
+
 	// Find the current maximum created_at
-	latestQuery := `
+	schema := s.getGroupSchema()
+	latestQuery := fmt.Sprintf(`
 		SELECT MAX(created_at) 
-		FROM moss_api.admin_keys 
+		FROM %s.admin_keys 
 		WHERE group_id = $1
-	`
+	`, schema)
 	var maxCreatedAt int64
 	err := tx.QueryRowContext(ctx, latestQuery, groupID).Scan(&maxCreatedAt)
 	if err != nil {
@@ -395,22 +702,22 @@ func (s *Server) updateLatestFlagsForAdminKeys(ctx context.Context, backend *pos
 	}
 
 	// Reset only the records that are currently latest=true but should not be
-	resetLatestQuery := `
-		UPDATE moss_api.admin_keys 
+	resetLatestQuery := fmt.Sprintf(`
+		UPDATE %s.admin_keys 
 		SET latest = false 
 		WHERE group_id = $1 AND latest = true AND created_at != $2
-	`
+	`, schema)
 	_, err = tx.ExecContext(ctx, resetLatestQuery, groupID, maxCreatedAt)
 	if err != nil {
 		return fmt.Errorf("failed to reset admin key latest flags: %w", err)
 	}
 
 	// Set latest=true for records with the maximum created_at that aren't already latest
-	setLatestQuery := `
-		UPDATE moss_api.admin_keys 
+	setLatestQuery := fmt.Sprintf(`
+		UPDATE %s.admin_keys 
 		SET latest = true 
 		WHERE group_id = $1 AND created_at = $2 AND latest = false
-	`
+	`, schema)
 	_, err = tx.ExecContext(ctx, setLatestQuery, groupID, maxCreatedAt)
 	if err != nil {
 		return fmt.Errorf("failed to set admin key latest flags: %w", err)
@@ -450,6 +757,24 @@ func (s *Server) handleMemberAdditionEvent(ctx context.Context, evt *nostr.Event
 			encryptKey = evt.PubKey
 		}
 
+		// Permission: if group requires join approval, adding members via 3047 is forbidden
+		required, errJA := s.isJoinApprovalRequired(ctx, postgresBackend, request.GroupID)
+		if errJA != nil {
+			// Align with bot behavior: treat as not required on error, but log
+			s.Log.Warningf("join approval check failed for group %s: %v; treating as not required", request.GroupID, errJA)
+		} else if required {
+			return fmt.Errorf("forbidden: group %s requires join approval; cannot add members via 3047", request.GroupID)
+		}
+
+		// Additional check: sender must be an existing member
+		senderIsMember, errSM := s.isMember(ctx, postgresBackend, request.GroupID, evt.PubKey)
+		if errSM != nil {
+			return fmt.Errorf("failed to verify sender membership: %w", errSM)
+		}
+		if !senderIsMember {
+			return fmt.Errorf("forbidden: sender %s is not a member of group %s", evt.PubKey, request.GroupID)
+		}
+
 		// Process all new members
 		for _, member := range request.Members {
 			if len(member) < 2 {
@@ -459,6 +784,17 @@ func (s *Server) handleMemberAdditionEvent(ctx context.Context, evt *nostr.Event
 			
 			memberPubKey := member[0]
 			encryptedKey := member[1]
+
+			// Skip if already a current member
+			already, err := s.isMember(ctx, postgresBackend, request.GroupID, memberPubKey)
+			if err != nil {
+				s.Log.Errorf("Failed to check existing membership for %s in %s: %v", memberPubKey, request.GroupID, err)
+				continue
+			}
+			if already {
+				s.Log.Infof("Member %s already in group %s, skipping", memberPubKey, request.GroupID)
+				continue
+			}
 
 			membershipData := GroupMembershipData{
 				EventID:             evt.ID,
@@ -474,10 +810,10 @@ func (s *Server) handleMemberAdditionEvent(ctx context.Context, evt *nostr.Event
 				InsertedAt:          time.Now().Unix(),
 			}
 
-			err := s.upsertGroupMembershipInline(ctx, postgresBackend, membershipData)
-			if err != nil {
+			upsertErr := s.upsertGroupMembershipInline(ctx, postgresBackend, membershipData)
+			if upsertErr != nil {
 				s.Log.Errorf("Failed to add member %s to group %s: %v", 
-					memberPubKey, request.GroupID, err)
+					memberPubKey, request.GroupID, upsertErr)
 				// Continue processing other members
 				continue
 			}
@@ -506,22 +842,23 @@ func (s *Server) upsertGroupMembershipInline(ctx context.Context, backend *postg
 	// Schema is already ensured in handleGroupManagementEventInline, skip here to avoid context cancellation
 	s.Log.Infof("Schema already ensured, proceeding with insert/update for member %s", data.MemberPubkey)
 
-	query := `
-		INSERT INTO moss_api.group_memberships (
-			event_id, group_id, member_pubkey, encrypted_session_key, admin_pubkey, 
-			gen_pubkey, pre_gen_pubkey, latest, decrypt_type, created_at, inserted_at
-		)
-		VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11)
-		ON CONFLICT (event_id, group_id, member_pubkey)
-		DO UPDATE SET
-			encrypted_session_key = EXCLUDED.encrypted_session_key,
-			admin_pubkey = EXCLUDED.admin_pubkey,
-			gen_pubkey = EXCLUDED.gen_pubkey,
-			pre_gen_pubkey = EXCLUDED.pre_gen_pubkey,
-			latest = EXCLUDED.latest,
-			decrypt_type = EXCLUDED.decrypt_type,
-			inserted_at = EXCLUDED.inserted_at
-	`
+    schema := s.getGroupSchema()
+    query := fmt.Sprintf(`
+        INSERT INTO %s.group_memberships (
+            event_id, group_id, member_pubkey, encrypted_session_key, admin_pubkey, 
+            gen_pubkey, pre_gen_pubkey, latest, decrypt_type, created_at, inserted_at
+        )
+        VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, to_timestamp($10::double precision), to_timestamp($11::double precision))
+        ON CONFLICT (event_id, group_id, member_pubkey)
+        DO UPDATE SET
+            encrypted_session_key = EXCLUDED.encrypted_session_key,
+            admin_pubkey = EXCLUDED.admin_pubkey,
+            gen_pubkey = EXCLUDED.gen_pubkey,
+            pre_gen_pubkey = EXCLUDED.pre_gen_pubkey,
+            latest = EXCLUDED.latest,
+            decrypt_type = EXCLUDED.decrypt_type,
+            inserted_at = EXCLUDED.inserted_at
+        `, schema)
 
 	args := []interface{}{
 		data.EventID,
@@ -566,19 +903,20 @@ func (s *Server) upsertGroupMembershipInline(ctx context.Context, backend *postg
 func (s *Server) upsertAdminKeyInline(ctx context.Context, backend *postgresql.PostgresBackend, data AdminKeyData) error {
 	// Schema is already ensured in handleGroupManagementEventInline, skip here to avoid context cancellation
 
-	query := `
-		INSERT INTO moss_api.admin_keys (
-			event_id, group_id, owner_pubkey, user_pubkey, encrypted_private_key, 
-			latest, created_at, inserted_at
-		)
-		VALUES ($1, $2, $3, $4, $5, $6, $7, $8)
-		ON CONFLICT (event_id, group_id, user_pubkey)
-		DO UPDATE SET
-			owner_pubkey = EXCLUDED.owner_pubkey,
-			encrypted_private_key = EXCLUDED.encrypted_private_key,
-			latest = EXCLUDED.latest,
-			inserted_at = EXCLUDED.inserted_at
-	`
+    schema := s.getGroupSchema()
+    query := fmt.Sprintf(`
+        INSERT INTO %s.admin_keys (
+            event_id, group_id, owner_pubkey, user_pubkey, encrypted_private_key, 
+            latest, created_at, inserted_at
+        )
+        VALUES ($1, $2, $3, $4, $5, $6, to_timestamp($7::double precision), to_timestamp($8::double precision))
+        ON CONFLICT (event_id, group_id, user_pubkey)
+        DO UPDATE SET
+            owner_pubkey = EXCLUDED.owner_pubkey,
+            encrypted_private_key = EXCLUDED.encrypted_private_key,
+            latest = EXCLUDED.latest,
+            inserted_at = EXCLUDED.inserted_at
+        `, schema)
 
 	args := []interface{}{
 		data.EventID,
@@ -603,72 +941,102 @@ func (s *Server) upsertAdminKeyInline(ctx context.Context, backend *postgresql.P
 }
 
 // ensureGroupMembershipsSchemaInline ensures the group_memberships table exists with correct schema
+var groupSchemaOnce sync.Once
+
 func (s *Server) ensureGroupMembershipsSchemaInline(ctx context.Context, backend *postgresql.PostgresBackend) error {
-	// Create a separate context for schema operations to avoid cancellation issues
-	// Schema creation should not be interrupted by transaction timeouts
-	schemaCtx := context.Background()
-	
-	// Schema creation must be executed immediately and not wait for outer transaction commit
-	// Use direct DB connection instead of transaction for schema operations
-	statements := []string{
-		`CREATE SCHEMA IF NOT EXISTS moss_api`,
-		
-		`CREATE TABLE IF NOT EXISTS moss_api.group_memberships (
-			id SERIAL PRIMARY KEY,
-			event_id VARCHAR(64) NOT NULL,
-			group_id VARCHAR(64) NOT NULL,
-			member_pubkey VARCHAR(64) NOT NULL,
-			encrypted_session_key TEXT NOT NULL,
-			admin_pubkey VARCHAR(64) NOT NULL,
-			gen_pubkey VARCHAR(64) NOT NULL DEFAULT 'default_value',
-			pre_gen_pubkey VARCHAR(64),
-			latest BOOLEAN NOT NULL DEFAULT false,
-			decrypt_type INTEGER NOT NULL DEFAULT 0,
-			created_at BIGINT NOT NULL,
-			inserted_at BIGINT NOT NULL,
-			UNIQUE(event_id, group_id, member_pubkey)
-		)`,
-		
-		`CREATE INDEX IF NOT EXISTS idx_group_memberships_event_group_member ON moss_api.group_memberships(event_id, group_id, member_pubkey)`,
-		`CREATE INDEX IF NOT EXISTS idx_group_memberships_query ON moss_api.group_memberships(member_pubkey, group_id, created_at, admin_pubkey, encrypted_session_key, decrypt_type)`,
-		`CREATE INDEX IF NOT EXISTS idx_group_id_latest_member_pubkey ON moss_api.group_memberships(group_id, latest, member_pubkey)`,
-		
-		`CREATE TABLE IF NOT EXISTS moss_api.admin_keys (
-			id SERIAL PRIMARY KEY,
-			event_id VARCHAR(64) NOT NULL,
-			group_id VARCHAR(64) NOT NULL,
-			owner_pubkey VARCHAR(64) NOT NULL,
-			user_pubkey VARCHAR(64) NOT NULL,
-			encrypted_private_key TEXT NOT NULL,
-			latest BOOLEAN NOT NULL DEFAULT false,
-			created_at BIGINT NOT NULL,
-			inserted_at BIGINT NOT NULL,
-			UNIQUE(event_id, group_id, user_pubkey)
-		)`,
-		
-		`CREATE INDEX IF NOT EXISTS idx_admin_keys_event_group_user ON moss_api.admin_keys(event_id, group_id, user_pubkey)`,
-	}
+	// Ensure schema only once per process
+	var onceErr error
+	groupSchemaOnce.Do(func() {
+		// Create a separate context for schema operations to avoid cancellation issues
+		// Schema creation should not be interrupted by transaction timeouts
+		schemaCtx := context.Background()
 
-	// Always use direct DB connection for schema operations to ensure immediate effect
-	// Use a clean context to avoid cancellation issues
-	for i, stmt := range statements {
-		if _, err := backend.DB.ExecContext(schemaCtx, stmt); err != nil {
-			s.Log.Errorf("Failed to execute schema statement %d: %s, error: %v", i+1, stmt, err)
-			return fmt.Errorf("failed to execute schema statement %d: %w", i+1, err)
+		// Schema creation must be executed immediately and not wait for outer transaction commit
+		// Use direct DB connection instead of transaction for schema operations
+		schema := s.getGroupSchema()
+		statements := []string{
+			fmt.Sprintf(`CREATE SCHEMA IF NOT EXISTS %s`, schema),
+		
+            fmt.Sprintf(`CREATE TABLE IF NOT EXISTS %s.group_memberships (
+                id SERIAL PRIMARY KEY,
+                event_id VARCHAR(64) NOT NULL,
+                group_id VARCHAR(64) NOT NULL,
+                member_pubkey VARCHAR(64) NOT NULL,
+                encrypted_session_key TEXT NOT NULL,
+                admin_pubkey VARCHAR(64) NOT NULL,
+                gen_pubkey VARCHAR(64) NOT NULL DEFAULT 'default_value',
+                pre_gen_pubkey VARCHAR(64),
+                latest BOOLEAN NOT NULL DEFAULT false,
+                decrypt_type INTEGER NOT NULL DEFAULT 0,
+                created_at TIMESTAMPTZ NOT NULL,
+                inserted_at TIMESTAMPTZ NOT NULL,
+                UNIQUE(event_id, group_id, member_pubkey)
+            )`, schema),
+		
+			fmt.Sprintf(`CREATE INDEX IF NOT EXISTS idx_group_memberships_event_group_member ON %s.group_memberships(event_id, group_id, member_pubkey)`, schema),
+			fmt.Sprintf(`CREATE INDEX IF NOT EXISTS idx_group_memberships_query ON %s.group_memberships(member_pubkey, group_id, created_at, admin_pubkey, encrypted_session_key, decrypt_type)`, schema),
+			fmt.Sprintf(`CREATE INDEX IF NOT EXISTS idx_group_id_latest_member_pubkey ON %s.group_memberships(group_id, latest, member_pubkey)`, schema),
+		
+            fmt.Sprintf(`CREATE TABLE IF NOT EXISTS %s.admin_keys (
+                id SERIAL PRIMARY KEY,
+                event_id VARCHAR(64) NOT NULL,
+                group_id VARCHAR(64) NOT NULL,
+                owner_pubkey VARCHAR(64) NOT NULL,
+                user_pubkey VARCHAR(64) NOT NULL,
+                encrypted_private_key TEXT NOT NULL,
+                latest BOOLEAN NOT NULL DEFAULT false,
+                created_at TIMESTAMPTZ NOT NULL,
+                inserted_at TIMESTAMPTZ NOT NULL,
+                UNIQUE(event_id, group_id, user_pubkey)
+            )`, schema),
+		
+			fmt.Sprintf(`CREATE INDEX IF NOT EXISTS idx_admin_keys_event_group_user ON %s.admin_keys(event_id, group_id, user_pubkey)`, schema),
+		
+			fmt.Sprintf(`CREATE TABLE IF NOT EXISTS %s.group_approval_status (
+                id BIGINT GENERATED BY DEFAULT AS IDENTITY NOT NULL,
+                group_id VARCHAR NOT NULL,
+                is_join_approval_required BOOLEAN DEFAULT false NOT NULL,
+                created_at TIMESTAMPTZ NOT NULL,
+                updated_at TIMESTAMPTZ NOT NULL,
+                CONSTRAINT group_approval_status_pkey PRIMARY KEY (id)
+            )`, schema),
+		
+			fmt.Sprintf(`CREATE UNIQUE INDEX IF NOT EXISTS group_approval_status_group_id_key ON %s.group_approval_status USING btree (group_id)`, schema),
+		
+			fmt.Sprintf(`CREATE TABLE IF NOT EXISTS %s.member_alias (
+                id BIGINT GENERATED BY DEFAULT AS IDENTITY NOT NULL,
+                group_id VARCHAR NOT NULL,
+                member_pubkey VARCHAR NOT NULL,
+                alias VARCHAR NOT NULL,
+                created_at TIMESTAMPTZ NOT NULL,
+                CONSTRAINT member_alias_pkey PRIMARY KEY (id)
+            )`, schema),
+		
+			fmt.Sprintf(`CREATE UNIQUE INDEX IF NOT EXISTS memberalias_group_id_member_pubkey ON %s.member_alias USING btree (group_id, member_pubkey)`, schema),
 		}
-		s.Log.Infof("Successfully executed schema statement %d", i+1)
-	}
 
-	s.Log.Infof("Successfully ensured group management schema exists")
-	return nil
+		// Always use direct DB connection for schema operations to ensure immediate effect
+		// Use a clean context to avoid cancellation issues
+		for i, stmt := range statements {
+			if _, err := backend.DB.ExecContext(schemaCtx, stmt); err != nil {
+				s.Log.Errorf("Failed to execute schema statement %d: %s, error: %v", i+1, stmt, err)
+				onceErr = fmt.Errorf("failed to execute schema statement %d: %w", i+1, err)
+				return
+			}
+			s.Log.Infof("Successfully executed schema statement %d", i+1)
+		}
+
+		s.Log.Infof("Successfully ensured group management schema exists")
+	})
+
+	return onceErr
 }
 
 // decryptMessage decrypts NIP-04 or NIP-44 encrypted messages
 func (s *Server) decryptMessage(encryptedContent, botPrivateKey, senderPubKey string) (string, error) {
-	// Check if content is encrypted (should start with encryption indicator)
+	// Require encrypted content (NIP-04 or NIP-44)
 	if !strings.Contains(encryptedContent, "?iv=") && !strings.HasPrefix(encryptedContent, "nip44_") {
-		// Might be plain text, return as is
-		return encryptedContent, nil
+		return "", fmt.Errorf("invalid content: expected encrypted payload (nip04 or nip44)")
 	}
 
 	// Try NIP-04 decryption first (most common in group_bot)
@@ -700,4 +1068,488 @@ func (s *Server) decryptMessage(encryptedContent, botPrivateKey, senderPubKey st
 	}
 
 	return "", fmt.Errorf("failed to decrypt message with both NIP-04 and NIP-44")
+}
+
+// handleIsShareableEvent processes 20041 events (group shareable status)
+func (s *Server) handleIsShareableEvent(ctx context.Context, evt *nostr.Event, botPrivateKey string) error {
+	s.Log.Infof("Processing 20041 (is_shareable) event ID: %s from %s", evt.ID, evt.PubKey)
+
+	// Decrypt the content using NIP-44
+	decryptedContent, err := s.decryptMessageWithNIP44(evt.Content, botPrivateKey, evt.PubKey)
+	if err != nil {
+		return fmt.Errorf("failed to decrypt 20041 content: %w", err)
+	}
+
+	s.Log.Infof("Decrypted 20041 content: %s", decryptedContent)
+
+	var request IsShareableRequest
+	if err := json.Unmarshal([]byte(decryptedContent), &request); err != nil {
+		return fmt.Errorf("failed to parse is_shareable request: %w", err)
+	}
+
+	// Permission: require admin (no initial creation fallback for 20041)
+	store := s.relay.Storage(ctx)
+	postgresBackend, ok := store.(*postgresql.PostgresBackend)
+	if !ok {
+		return errUnsupportedGroupMgmtBackend
+	}
+	// If group has admins, require sender to be admin; otherwise allow (fresh group creation case)
+	hasAdmin, errGA := s.groupHasAnyAdmin(ctx, postgresBackend, request.GroupID)
+	if errGA != nil {
+		s.Log.Warningf("20041: failed to check admin presence for group %s: %v; allowing as fresh group", request.GroupID, errGA)
+	}
+	if hasAdmin {
+		okAdmin, errAdmin := s.isAdmin(ctx, postgresBackend, request.GroupID, evt.PubKey)
+		if errAdmin != nil { return fmt.Errorf("permission check failed: %w", errAdmin) }
+		if !okAdmin {
+			return fmt.Errorf("forbidden: 20041 requires admin of group %s", request.GroupID)
+		}
+	}
+
+	// Like group_bot, don't store to database, just publish a 32040 event
+	err = s.publishShareableStatusEvent(ctx, request.GroupID, request.IsShareable, botPrivateKey)
+	if err != nil {
+		s.Log.Errorf("Failed to publish shareable status event for group %s: %v", request.GroupID, err)
+		return err
+	}
+
+	s.Log.Infof("Successfully published shareable status event for group %s (shareable: %v)", request.GroupID, request.IsShareable)
+	return nil
+}
+
+// handleJoinApprovalEvent processes 20042 events (group join approval status)
+func (s *Server) handleJoinApprovalEvent(ctx context.Context, evt *nostr.Event, botPrivateKey string) error {
+	s.Log.Infof("Processing 20042 (join_approval) event ID: %s from %s", evt.ID, evt.PubKey)
+
+	// Decrypt the content using NIP-44
+	decryptedContent, err := s.decryptMessageWithNIP44(evt.Content, botPrivateKey, evt.PubKey)
+	if err != nil {
+		return fmt.Errorf("failed to decrypt 20042 content: %w", err)
+	}
+
+	s.Log.Infof("Decrypted 20042 content: %s", decryptedContent)
+
+	var request JoinApprovalRequest
+	if err := json.Unmarshal([]byte(decryptedContent), &request); err != nil {
+		return fmt.Errorf("failed to parse join_approval request: %w", err)
+	}
+
+	store := s.relay.Storage(ctx)
+	postgresBackend, ok := store.(*postgresql.PostgresBackend)
+	if !ok {
+		return errUnsupportedGroupMgmtBackend
+	}
+
+	// Permission: if group has admins, require admin; otherwise allow (fresh group creation)
+	hasAdmin, errGA := s.groupHasAnyAdmin(ctx, postgresBackend, request.GroupID)
+	if errGA != nil {
+		s.Log.Warningf("20042: failed to check admin presence for group %s: %v; allowing as fresh group", request.GroupID, errGA)
+	}
+	if hasAdmin {
+		okAdmin, errAdmin := s.isAdmin(ctx, postgresBackend, request.GroupID, evt.PubKey)
+		if errAdmin != nil { return fmt.Errorf("permission check failed: %w", errAdmin) }
+		if !okAdmin {
+			return fmt.Errorf("forbidden: 20042 requires admin of group %s", request.GroupID)
+		}
+	}
+
+	approvalData := GroupApprovalData{
+		GroupID:               request.GroupID,
+		IsJoinApprovalRequired: request.IsJoinApprovalRequired,
+		CreatedAt:             evt.CreatedAt.Time(),
+		UpdatedAt:             time.Now(),
+	}
+
+	err = s.upsertGroupApprovalInline(ctx, postgresBackend, approvalData)
+	if err != nil {
+		s.Log.Errorf("Failed to update join approval status for group %s: %v", request.GroupID, err)
+		return err
+	}
+
+	s.Log.Infof("Successfully updated join approval status for group %s to %v", request.GroupID, request.IsJoinApprovalRequired)
+	return nil
+}
+
+// handleAliasEvent processes 39304 events (member alias)
+func (s *Server) handleAliasEvent(ctx context.Context, evt *nostr.Event, botPrivateKey string) error {
+	s.Log.Infof("Processing 39304 (alias) event ID: %s from %s", evt.ID, evt.PubKey)
+
+	// Extract group ID from event tags
+	var groupID string
+	for _, tag := range evt.Tags {
+		if len(tag) >= 2 && tag[0] == "d" {
+			groupID = tag[1]
+			break
+		}
+	}
+	if groupID == "" {
+		return fmt.Errorf("no group ID found in event tags")
+	}
+
+	// Decrypt the alias using NIP-04
+	decryptedAlias, err := s.decryptMessage(evt.Content, botPrivateKey, evt.PubKey)
+	if err != nil {
+		return fmt.Errorf("failed to decrypt alias content: %w", err)
+	}
+
+	// Permission: require member of the group
+	store := s.relay.Storage(ctx)
+	postgresBackend, ok := store.(*postgresql.PostgresBackend)
+	if !ok {
+		return errUnsupportedGroupMgmtBackend
+	}
+	okMember, errMember := s.isMember(ctx, postgresBackend, groupID, evt.PubKey)
+	if errMember != nil { return fmt.Errorf("permission check failed: %w", errMember) }
+	if !okMember {
+		return fmt.Errorf("forbidden: 39304 requires group member of %s", groupID)
+	}
+
+	s.Log.Infof("Decrypted alias for group %s: %s", groupID, decryptedAlias)
+
+	aliasData := MemberAliasData{
+		GroupID:      groupID,
+		MemberPubkey: evt.PubKey,
+		Alias:        decryptedAlias,
+		CreatedAt:    evt.CreatedAt.Time(),
+	}
+
+	err = s.upsertMemberAliasInline(ctx, postgresBackend, aliasData)
+	if err != nil {
+		s.Log.Errorf("Failed to update alias for member %s in group %s: %v", evt.PubKey, groupID, err)
+		return err
+	}
+
+	s.Log.Infof("Successfully updated alias for member %s in group %s to %s", evt.PubKey, groupID, decryptedAlias)
+
+	// After updating the alias, publish the updated alias list for the group (like group_bot does)
+	err = s.publishAliasListForGroup(ctx, postgresBackend, groupID, botPrivateKey)
+	if err != nil {
+		s.Log.Errorf("Failed to publish alias list for group %s: %v", groupID, err)
+		// Don't return error here as the alias was successfully stored
+		// This is just a notification that may fail
+	}
+
+	return nil
+}
+
+// upsertGroupApprovalInline inserts or updates group approval status
+func (s *Server) upsertGroupApprovalInline(ctx context.Context, backend *postgresql.PostgresBackend, data GroupApprovalData) error {
+	schema := s.getGroupSchema()
+	query := fmt.Sprintf(`
+        INSERT INTO %s.group_approval_status (
+            group_id, is_join_approval_required, created_at, updated_at
+        )
+        VALUES ($1, $2, $3, $4)
+        ON CONFLICT (group_id)
+        DO UPDATE SET
+            is_join_approval_required = EXCLUDED.is_join_approval_required,
+            updated_at = EXCLUDED.updated_at
+    `, schema)
+
+	args := []interface{}{
+		data.GroupID,
+		data.IsJoinApprovalRequired,
+		data.CreatedAt,
+		data.UpdatedAt,
+	}
+
+	// Check if we have a transaction in context
+	if tx, hasTx := eventstore.TxFrom(ctx); hasTx {
+		_, err := tx.ExecContext(ctx, query, args...)
+		return err
+	}
+
+	// No transaction, use direct DB connection
+	_, err := backend.DB.ExecContext(ctx, query, args...)
+	return err
+}
+
+// upsertMemberAliasInline inserts or updates member alias
+func (s *Server) upsertMemberAliasInline(ctx context.Context, backend *postgresql.PostgresBackend, data MemberAliasData) error {
+	schema := s.getGroupSchema()
+	query := fmt.Sprintf(`
+        INSERT INTO %s.member_alias (
+            group_id, member_pubkey, alias, created_at
+        )
+        VALUES ($1, $2, $3, $4)
+        ON CONFLICT (group_id, member_pubkey)
+        DO UPDATE SET
+            alias = EXCLUDED.alias,
+            created_at = EXCLUDED.created_at
+        WHERE EXCLUDED.created_at > %s.member_alias.created_at
+    `, schema, schema)
+
+	args := []interface{}{
+		data.GroupID,
+		data.MemberPubkey,
+		data.Alias,
+		data.CreatedAt,
+	}
+
+	// Check if we have a transaction in context
+	if tx, hasTx := eventstore.TxFrom(ctx); hasTx {
+		_, err := tx.ExecContext(ctx, query, args...)
+		return err
+	}
+
+	// No transaction, use direct DB connection
+	_, err := backend.DB.ExecContext(ctx, query, args...)
+	return err
+}
+
+// decryptMessageWithNIP44 decrypts NIP-44 encrypted messages specifically
+func (s *Server) decryptMessageWithNIP44(encryptedContent, botPrivateKey, senderPubKey string) (string, error) {
+	conversationKey, err := nip44.GenerateConversationKey(senderPubKey, botPrivateKey)
+	if err != nil {
+		return "", fmt.Errorf("failed to generate NIP-44 conversation key: %w", err)
+	}
+	
+	decrypted, err := nip44.Decrypt(encryptedContent, conversationKey)
+	if err != nil {
+		return "", fmt.Errorf("failed to decrypt with NIP-44: %w", err)
+	}
+	
+	return decrypted, nil
+}
+
+// publishAliasListForGroup publishes a 39305 event with all aliases for the group
+func (s *Server) publishAliasListForGroup(ctx context.Context, backend *postgresql.PostgresBackend, groupID, botPrivateKey string) error {
+	// Get all aliases for the group from database
+	aliases, err := s.getAllAliasesForGroup(ctx, backend, groupID)
+	if err != nil {
+		return fmt.Errorf("failed to get aliases for group %s: %w", groupID, err)
+	}
+
+	// Get the group's genPubkey
+	genPubkey, err := s.getGroupGenPubkey(ctx, backend, groupID)
+	if err != nil {
+		return fmt.Errorf("failed to get genPubkey for group %s: %w", groupID, err)
+	}
+
+	// Prepare the alias list content
+	aliasList := make([][]string, 0, len(aliases))
+	for _, alias := range aliases {
+		aliasList = append(aliasList, []string{alias.MemberPubkey, alias.Alias})
+	}
+
+	content := map[string]interface{}{
+		"groupId": groupID,
+		"alias":   aliasList,
+	}
+
+	contentBytes, err := json.Marshal(content)
+	if err != nil {
+		return fmt.Errorf("failed to marshal alias list content: %w", err)
+	}
+
+	// Encrypt content with NIP-44
+	encryptedContent, err := s.encryptContentWithNIP44(string(contentBytes), botPrivateKey, genPubkey)
+	if err != nil {
+		return fmt.Errorf("failed to encrypt alias list content: %w", err)
+	}
+
+	// Get bot public key
+	botPubkey, err := nostr.GetPublicKey(botPrivateKey)
+	if err != nil {
+		return fmt.Errorf("failed to get bot public key: %w", err)
+	}
+
+	// Create the 39305 event
+	aliasListEvent := nostr.Event{
+		PubKey:    botPubkey,
+		CreatedAt: nostr.Now(),
+		Kind:      39305,
+		Tags: nostr.Tags{
+			{"d", genPubkey},
+			{"p", genPubkey},
+		},
+		Content: encryptedContent,
+	}
+
+	// Sign the event
+	if err := aliasListEvent.Sign(botPrivateKey); err != nil {
+		return fmt.Errorf("failed to sign alias list event: %w", err)
+	}
+
+	// Publish the event through the relay (we need to implement this)
+	err = s.publishEventToRelay(ctx, &aliasListEvent)
+	if err != nil {
+		return fmt.Errorf("failed to publish alias list event: %w", err)
+	}
+
+	s.Log.Infof("Successfully published alias list for group %s with %d aliases", groupID, len(aliases))
+	return nil
+}
+
+// getAllAliasesForGroup retrieves all aliases for a given group
+func (s *Server) getAllAliasesForGroup(ctx context.Context, backend *postgresql.PostgresBackend, groupID string) ([]MemberAliasData, error) {
+	schema := s.getGroupSchema()
+	query := fmt.Sprintf(`
+		SELECT group_id, member_pubkey, alias, created_at
+		FROM %s.member_alias
+		WHERE group_id = $1
+		ORDER BY member_pubkey
+	`, schema)
+
+	var aliases []MemberAliasData
+
+	// Check if we have a transaction in context
+	if tx, hasTx := eventstore.TxFrom(ctx); hasTx {
+		rows, err := tx.QueryContext(ctx, query, groupID)
+		if err != nil {
+			return nil, err
+		}
+		defer rows.Close()
+
+		for rows.Next() {
+			var alias MemberAliasData
+			err := rows.Scan(&alias.GroupID, &alias.MemberPubkey, &alias.Alias, &alias.CreatedAt)
+			if err != nil {
+				return nil, err
+			}
+			aliases = append(aliases, alias)
+		}
+		return aliases, nil
+	}
+
+	// No transaction, use direct DB connection
+	rows, err := backend.DB.QueryContext(ctx, query, groupID)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+
+	for rows.Next() {
+		var alias MemberAliasData
+		err := rows.Scan(&alias.GroupID, &alias.MemberPubkey, &alias.Alias, &alias.CreatedAt)
+		if err != nil {
+			return nil, err
+		}
+		aliases = append(aliases, alias)
+	}
+
+	return aliases, nil
+}
+
+// getGroupGenPubkey retrieves the genPubkey for a group from the latest membership records
+func (s *Server) getGroupGenPubkey(ctx context.Context, backend *postgresql.PostgresBackend, groupID string) (string, error) {
+	schema := s.getGroupSchema()
+	query := fmt.Sprintf(`
+		SELECT gen_pubkey
+		FROM %s.group_memberships
+		WHERE group_id = $1 AND latest = true
+		LIMIT 1
+	`, schema)
+
+	var genPubkey string
+
+	// Check if we have a transaction in context
+	if tx, hasTx := eventstore.TxFrom(ctx); hasTx {
+		err := tx.QueryRowContext(ctx, query, groupID).Scan(&genPubkey)
+		if err != nil {
+			return "", err
+		}
+	} else {
+		// No transaction, use direct DB connection
+		err := backend.DB.QueryRowContext(ctx, query, groupID).Scan(&genPubkey)
+		if err != nil {
+			return "", err
+		}
+	}
+
+	if genPubkey == "" || genPubkey == "default_value" {
+		return "", fmt.Errorf("genPubkey is empty or default for group %s", groupID)
+	}
+
+	return genPubkey, nil
+}
+
+// encryptContentWithNIP44 encrypts content using NIP-44
+func (s *Server) encryptContentWithNIP44(content, botPrivateKey, recipientPubkey string) (string, error) {
+	conversationKey, err := nip44.GenerateConversationKey(recipientPubkey, botPrivateKey)
+	if err != nil {
+		return "", fmt.Errorf("failed to generate conversation key: %w", err)
+	}
+
+	encrypted, err := nip44.Encrypt(content, conversationKey)
+	if err != nil {
+		return "", fmt.Errorf("failed to encrypt content: %w", err)
+	}
+
+	return encrypted, nil
+}
+
+// publishEventToRelay publishes an event to the relay
+func (s *Server) publishEventToRelay(ctx context.Context, evt *nostr.Event) error {
+	// Store the event in the relay's storage
+	store := s.relay.Storage(ctx)
+	if store != nil {
+		if err := store.SaveEvent(ctx, evt); err != nil {
+			return fmt.Errorf("failed to save event to relay storage: %w", err)
+		}
+	}
+
+	// Broadcast after commit if inside a transaction; otherwise broadcast now
+	if queued := queuePostCommitBroadcast(ctx, evt); !queued {
+		s.broadcastEvent(evt)
+		// Also propagate to external listeners if supported
+		if b, ok := s.relay.(EventBroadcaster); ok {
+			b.BroadcastEvent(evt)
+		}
+	}
+
+	return nil
+}
+
+// broadcastEvent broadcasts an event to all connected websocket clients
+func (s *Server) broadcastEvent(evt *nostr.Event) {
+	// Use the existing relay broadcasting functionality
+	BroadcastEvent(evt)
+	s.Log.Infof("Broadcasted event %s (kind %d) to connected clients", evt.ID, evt.Kind)
+}
+
+// publishShareableStatusEvent publishes a 32040 event with shareable status
+func (s *Server) publishShareableStatusEvent(ctx context.Context, groupID string, isShareable bool, botPrivateKey string) error {
+	// Create content structure like group_bot does
+	contentStruct := struct {
+		Shareable bool `json:"shareable"`
+	}{
+		Shareable: isShareable,
+	}
+
+	contentBytes, err := json.Marshal(contentStruct)
+	if err != nil {
+		return fmt.Errorf("failed to marshal shareable content: %w", err)
+	}
+
+	// Get bot public key
+	botPubkey, err := nostr.GetPublicKey(botPrivateKey)
+	if err != nil {
+		return fmt.Errorf("failed to get bot public key: %w", err)
+	}
+
+	// Create the 32040 event
+	shareableEvent := nostr.Event{
+		PubKey:    botPubkey,
+		CreatedAt: nostr.Now(),
+		Kind:      32040,
+		Tags: nostr.Tags{
+			{"d", groupID},
+		},
+		Content: string(contentBytes),
+	}
+
+	// Sign the event
+	if err := shareableEvent.Sign(botPrivateKey); err != nil {
+		return fmt.Errorf("failed to sign shareable event: %w", err)
+	}
+
+	// Publish the event through the relay
+	err = s.publishEventToRelay(ctx, &shareableEvent)
+	if err != nil {
+		return fmt.Errorf("failed to publish shareable event: %w", err)
+	}
+
+	s.Log.Infof("Successfully published shareable status event for group %s (shareable: %v)", groupID, isShareable)
+	return nil
 }
