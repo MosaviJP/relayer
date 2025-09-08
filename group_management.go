@@ -1140,19 +1140,6 @@ func (s *Server) handleJoinApprovalEvent(ctx context.Context, evt *nostr.Event, 
 		return errUnsupportedGroupMgmtBackend
 	}
 
-	// Permission: if group has admins, require admin; otherwise allow (fresh group creation)
-	hasAdmin, errGA := s.groupHasAnyAdmin(ctx, postgresBackend, request.GroupID)
-	if errGA != nil {
-		s.Log.Warningf("20042: failed to check admin presence for group %s: %v; allowing as fresh group", request.GroupID, errGA)
-	}
-	if hasAdmin {
-		okAdmin, errAdmin := s.isAdmin(ctx, postgresBackend, request.GroupID, evt.PubKey)
-		if errAdmin != nil { return fmt.Errorf("permission check failed: %w", errAdmin) }
-		if !okAdmin {
-			return fmt.Errorf("forbidden: 20042 requires admin of group %s", request.GroupID)
-		}
-	}
-
 	approvalData := GroupApprovalData{
 		GroupID:               request.GroupID,
 		IsJoinApprovalRequired: request.IsJoinApprovalRequired,
