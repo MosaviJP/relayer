@@ -5,13 +5,14 @@ go 1.24.1
 toolchain go1.24.5
 
 require (
-	github.com/MosaviJP/eventstore v0.0.0-20250901073919-091c51a59ec6
+	github.com/MosaviJP/eventstore v0.0.0-20250909061408-397e335c70a0
 	github.com/PuerkitoBio/goquery v1.10.1
 	github.com/cockroachdb/pebble v1.1.4
 	github.com/fasthttp/websocket v1.5.12
 	github.com/gobwas/ws v1.4.0
 	github.com/grokify/html-strip-tags-go v0.1.0
 	github.com/jb55/lnsocket/go v0.0.0-20230807153023-0fad35b1352d
+	github.com/jmoiron/sqlx v1.4.0
 	github.com/kelseyhightower/envconfig v1.4.0
 	github.com/lib/pq v1.10.9
 	github.com/mmcdole/gofeed v1.3.0
@@ -77,7 +78,6 @@ require (
 	github.com/gogo/protobuf v1.3.2 // indirect
 	github.com/golang/snappy v0.0.4 // indirect
 	github.com/jessevdk/go-flags v1.6.1 // indirect
-	github.com/jmoiron/sqlx v1.4.0 // indirect
 	github.com/josharian/intern v1.0.0 // indirect
 	github.com/jrick/logrotate v1.1.2 // indirect
 	github.com/json-iterator/go v1.1.12 // indirect
