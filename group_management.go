@@ -508,6 +508,12 @@ func (s *Server) handleGenKeyUpdate(ctx context.Context, evt *nostr.Event, decry
 	}
 	s.Log.Infof("Successfully updated latest flags for group %s", request.GroupID)
 
+	// After rotating gen key, republish the alias list (39305) to the new gen_pubkey
+	if err := s.publishAliasListForGroup(ctx, backend, request.GroupID, botPrivateKey); err != nil {
+		// Do not fail the rotation if publishing fails; just log
+		s.Log.Errorf("Failed to publish alias list (39305) for group %s after gen-key update: %v", request.GroupID, err)
+	}
+
 	return nil
 }
 
