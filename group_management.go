@@ -524,69 +524,46 @@ func (s *Server) updateLatestFlagsForGroupMembership(ctx context.Context, backen
 		return fmt.Errorf("transaction required for latest flag updates")
 	}
 
-	// Compatibility-safe implementation: compute latest purely in SQL to tolerate BIGINT/TIMESTAMPTZ
-	{
-		schema := s.getGroupSchema()
-		reset := fmt.Sprintf(`
-            UPDATE %s.group_memberships AS gm
-            SET latest = false
-            WHERE gm.group_id = $1 AND gm.latest = true AND NOT (
-                gm.created_at = (SELECT max(created_at) FROM %s.group_memberships WHERE group_id = $1)
-                AND gm.gen_pubkey = (
-                    SELECT max(gen_pubkey) FROM %s.group_memberships 
-                    WHERE group_id = $1 AND created_at = (SELECT max(created_at) FROM %s.group_memberships WHERE group_id = $1)
-                )
-            )
-        `, schema, schema, schema, schema)
-		if _, err := tx.ExecContext(ctx, reset, groupID); err != nil {
-			return fmt.Errorf("failed to reset latest flags: %w", err)
+	schema := s.getGroupSchema()
+	latestGenQuery := fmt.Sprintf(`
+		SELECT gen_pubkey
+		FROM %s.group_memberships
+		WHERE group_id = $1
+		  AND created_at = (
+			SELECT max(created_at)
+			FROM %s.group_memberships
+			WHERE group_id = $1
+		  )
+		ORDER BY gen_pubkey DESC
+		LIMIT 1
+	`, schema, schema)
+
+	var latestGen sql.NullString
+	if err := tx.QueryRowContext(ctx, latestGenQuery, groupID).Scan(&latestGen); err != nil {
+		if err == sql.ErrNoRows {
+			return nil
 		}
+		return fmt.Errorf("failed to determine latest gen_pubkey: %w", err)
+	}
+	if !latestGen.Valid || latestGen.String == "" {
+		return nil
+	}
 
-        set := fmt.Sprintf(`
-            UPDATE %s.group_memberships AS gm
-            SET latest = true
-            WHERE gm.group_id = $1 AND gm.latest = false
-              AND gm.created_at = (SELECT max(created_at) FROM %s.group_memberships WHERE group_id = $1)
-              AND gm.gen_pubkey = (
-                    SELECT max(gen_pubkey) FROM %s.group_memberships 
-                    WHERE group_id = $1 AND created_at = (SELECT max(created_at) FROM %s.group_memberships WHERE group_id = $1)
-              )
-        `, schema, schema, schema, schema)
-        if _, err := tx.ExecContext(ctx, set, groupID); err != nil {
-            return fmt.Errorf("failed to set latest flags: %w", err)
-        }
-        s.Log.Infof("Updated latest flags for group %s", groupID)
-        return nil
-    }
-
-    // Reset/Set using SQL-only comparisons to tolerate BIGINT/TIMESTAMPTZ
-    schema := s.getGroupSchema()
-    reset := fmt.Sprintf(`
-        UPDATE %s.group_memberships AS gm
-        SET latest = false
-        WHERE gm.group_id = $1 AND gm.latest = true AND NOT (
-            gm.created_at = (SELECT max(created_at) FROM %s.group_memberships WHERE group_id = $1)
-            AND gm.gen_pubkey = (
-                SELECT max(gen_pubkey) FROM %s.group_memberships 
-                WHERE group_id = $1 AND created_at = (SELECT max(created_at) FROM %s.group_memberships WHERE group_id = $1)
-            )
-        )
-    `, schema, schema, schema, schema)
-	if _, err := tx.ExecContext(ctx, reset, groupID); err != nil {
+	reset := fmt.Sprintf(`
+		UPDATE %s.group_memberships
+		SET latest = false
+		WHERE group_id = $1 AND latest = true AND gen_pubkey <> $2
+	`, schema)
+	if _, err := tx.ExecContext(ctx, reset, groupID, latestGen.String); err != nil {
 		return fmt.Errorf("failed to reset latest flags: %w", err)
 	}
 
 	set := fmt.Sprintf(`
-        UPDATE %s.group_memberships AS gm
-        SET latest = true
-        WHERE gm.group_id = $1 AND gm.latest = false
-          AND gm.created_at = (SELECT max(created_at) FROM %s.group_memberships WHERE group_id = $1)
-          AND gm.gen_pubkey = (
-                SELECT max(gen_pubkey) FROM %s.group_memberships 
-                WHERE group_id = $1 AND created_at = (SELECT max(created_at) FROM %s.group_memberships WHERE group_id = $1)
-          )
-    `, schema, schema, schema, schema)
-	if _, err := tx.ExecContext(ctx, set, groupID); err != nil {
+		UPDATE %s.group_memberships
+		SET latest = true
+		WHERE group_id = $1 AND gen_pubkey = $2 AND latest = false
+	`, schema)
+	if _, err := tx.ExecContext(ctx, set, groupID, latestGen.String); err != nil {
 		return fmt.Errorf("failed to set latest flags: %w", err)
 	}
 
