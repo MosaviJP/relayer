@@ -1233,7 +1233,7 @@ filterLoop:
     
     response := QueryResponse{
         Code: 0,
-        Msg:  fmt.Sprintf("getSessionKeysSuccess (%d events)", len(allEvents)),
+        Msg:  fmt.Sprintf("getEventsSuccess (%d events)", len(allEvents)),
         Data: allEvents,
     }
     
@@ -1254,7 +1254,7 @@ filterLoop:
         for maxEvents > 100 && len(responseBytes) > MAX_RESPONSE_SIZE {
             truncatedResponse := QueryResponse{
                 Code: 0,
-                Msg:  fmt.Sprintf("getSessionKeysSuccess (%d events, truncated from %d)", maxEvents, len(allEvents)),
+                Msg:  fmt.Sprintf("getEventsSuccess (%d events, truncated from %d)", maxEvents, len(allEvents)),
                 Data: allEvents[:maxEvents],
             }
             responseBytes, err = json.Marshal(truncatedResponse)
