@@ -56,12 +56,14 @@ func AddEvent(ctx context.Context, relay Relay, evt *nostr.Event) (accepted bool
 		}
 	}
 
-    notifyListeners(evt)
-
-    // propagate to external listeners if supported (e.g., Redis Pub/Sub)
-    if b, ok := relay.(EventBroadcaster); ok && evt != nil {
-        b.BroadcastEvent(evt)
-    }
+	// If within a transaction, queue for post-commit broadcast; else broadcast immediately
+	if !queuePostCommitBroadcast(ctx, evt) {
+		notifyListeners(evt)
+		// propagate to external listeners if supported (e.g., Redis Pub/Sub)
+		if b, ok := relay.(EventBroadcaster); ok && evt != nil {
+			b.BroadcastEvent(evt)
+		}
+	}
 
 	return true, ""
 }
@@ -94,14 +96,15 @@ func AddEvents(ctx context.Context, relay Relay, events []nostr.Event) (accepted
 		return false, fmt.Sprintf("AddEvents: errors: failed to save events (%s)", err.Error())
 	}
 
-    for _, evt := range events {
-        notifyListeners(&evt)
-        if b, ok := relay.(EventBroadcaster); ok {
-            // broadcast each event individually
-            e := evt
-            b.BroadcastEvent(&e)
-        }
-    }
+	for _, evt := range events {
+		e := evt
+		if !queuePostCommitBroadcast(ctx, &e) {
+			notifyListeners(&e)
+			if b, ok := relay.(EventBroadcaster); ok {
+				b.BroadcastEvent(&e)
+			}
+		}
+	}
 
 	return true, ""
 }
