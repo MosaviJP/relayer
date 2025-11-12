@@ -983,6 +983,11 @@ func (s *Server) handleMemberAdditionEvent(ctx context.Context, evt *nostr.Event
 			s.Log.Infof("Member addition for group %s, %d members to add",
 				request.GroupID, len(request.Members))
 
+			// Ensure legacy groups have baseline current members before incremental updates
+			if err := s.preprocessCurrentMembersInline(ctx, postgresBackend, request.GroupID); err != nil {
+				return fmt.Errorf("failed to prepare current members snapshot for group %s: %w", request.GroupID, err)
+			}
+
 			// Determine the admin pubkey (encryptPubkey or sender)
 			encryptKey := request.EncryptPubkey
 			if encryptKey == "" {
