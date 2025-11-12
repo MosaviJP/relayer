@@ -533,7 +533,7 @@ func (s *Server) handleSessionKeyRotationEvent(ctx context.Context, evt *nostr.E
 				hasMembers = true
 			}
 		}
-		if v, ok := rawData["admins"]; ok && v != nil {
+		if v, ok := rawData["roles"]; ok && v != nil {
 			if arr, ok2 := v.([]interface{}); ok2 && len(arr) > 0 {
 				hasRoles = true
 			}
@@ -1060,6 +1060,15 @@ func (s *Server) handleMemberAdditionEvent(ctx context.Context, evt *nostr.Event
 				s.Log.Errorf("Failed to update latest flags for group %s: %v", request.GroupID, err)
 				return err
 			}
+
+			// Sync new members into group_current_members
+			additionCreatedAt := evt.CreatedAt.Time().UTC()
+			if request.CreatedAt > 0 {
+				additionCreatedAt = time.Unix(request.CreatedAt, 0).UTC()
+			}
+			if err := s.upsertGroupCurrentMembersFromAddition(ctx, postgresBackend, request.GroupID, additionCreatedAt, request.Members); err != nil {
+				return fmt.Errorf("failed to sync group_current_members for addition in group %s: %w", request.GroupID, err)
+			}
 		}
 		return nil
 	}
@@ -1269,6 +1278,68 @@ func (s *Server) updateGroupCurrentMembersInline(
 	`, schema)
 	if _, err := tx.ExecContext(ctx, updateQuery, groupID); err != nil {
 		return fmt.Errorf("failed to update updated_at for group %s: %w", groupID, err)
+	}
+
+	return nil
+}
+
+// upsertGroupCurrentMembersFromAddition adds/updates members after a 3047 addition event.
+func (s *Server) upsertGroupCurrentMembersFromAddition(
+	ctx context.Context,
+	backend *postgresql.PostgresBackend,
+	groupID string,
+	createdAt time.Time,
+	members [][]string,
+) error {
+	if len(members) == 0 {
+		return nil
+	}
+
+	tx, hasTx := eventstore.TxFrom(ctx)
+	if !hasTx {
+		return fmt.Errorf("transaction required for updating current members")
+	}
+
+	schema := s.getGroupSchema()
+	now := time.Now().UTC()
+	seen := make(map[string]struct{}, len(members))
+	values := make([]string, 0, len(members))
+	args := make([]interface{}, 0, len(members)*4)
+	valid := 0
+
+	for _, member := range members {
+		if len(member) == 0 {
+			continue
+		}
+		memberPubKey := strings.TrimSpace(member[0])
+		if memberPubKey == "" {
+			continue
+		}
+		if _, exists := seen[memberPubKey]; exists {
+			continue
+		}
+		seen[memberPubKey] = struct{}{}
+		offset := valid * 4
+		values = append(values, fmt.Sprintf("($%d,$%d,$%d,$%d)", offset+1, offset+2, offset+3, offset+4))
+		args = append(args, groupID, memberPubKey, createdAt, now)
+		valid++
+	}
+
+	if valid == 0 {
+		return nil
+	}
+
+	query := fmt.Sprintf(`
+		INSERT INTO %s.group_current_members (group_id, member_pubkey, created_at, updated_at)
+		VALUES %s
+		ON CONFLICT (group_id, member_pubkey) DO UPDATE SET
+			created_at = EXCLUDED.created_at,
+			updated_at = EXCLUDED.updated_at
+		WHERE EXCLUDED.created_at > %s.group_current_members.created_at
+	`, schema, strings.Join(values, ","), schema)
+
+	if _, err := tx.ExecContext(ctx, query, args...); err != nil {
+		return fmt.Errorf("failed to upsert current members for group %s: %w", groupID, err)
 	}
 
 	return nil
