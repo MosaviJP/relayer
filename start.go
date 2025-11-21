@@ -116,11 +116,12 @@ func (s *Server) Start(host string, port int, started ...chan bool) error {
 
 	s.Addr = ln.Addr().String()
 	s.httpServer = &http.Server{
-		Handler:      cors.Default().Handler(s),
-		Addr:         addr,
-		WriteTimeout: 2 * time.Second,
-		ReadTimeout:  2 * time.Second,
-		IdleTimeout:  30 * time.Second,
+		Handler:           cors.Default().Handler(s),
+		Addr:              addr,
+		ReadHeaderTimeout: 5 * time.Second,
+		ReadTimeout:       10 * time.Second,
+		WriteTimeout:      10 * time.Second,
+		IdleTimeout:       30 * time.Second,
 	}
 
 	// notify caller that we're starting
@@ -138,7 +139,7 @@ func (s *Server) Start(host string, port int, started ...chan bool) error {
 	if s.dbSem == nil {
 		s.dbSem = make(chan struct{}, maxConc)
 	}
-	
+
 	if err := s.httpServer.Serve(ln); err == http.ErrServerClosed {
 		return nil
 	} else if err != nil {
