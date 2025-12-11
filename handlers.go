@@ -621,20 +621,12 @@ func (s *Server) doEvents(
 			return ""
 		}
 
-		// Set up proper transaction handling with defer
-		var txErr error
+		// rollback on any early return; cancelled once we successfully commit
+		committed := false
 		defer func() {
-			if txErr != nil {
+			if !committed {
 				tx.Rollback()
 				discardPostCommitBroadcast(tx)
-			} else {
-				if commitErr := tx.Commit(); commitErr != nil {
-					s.Log.Errorf("doEvents: failed to commit transaction: %v", commitErr)
-					discardPostCommitBroadcast(tx)
-				} else {
-					// flush any queued post-commit broadcasts
-					flushPostCommitBroadcast(tx, s.relay)
-				}
 			}
 		}()
 
@@ -644,7 +636,6 @@ func (s *Server) doEvents(
 		// Save events in same transaction (first)
 		accepted, reason := AddEvents(ctxWithTx, s.relay, events)
 		if !accepted {
-			txErr = fmt.Errorf("batch failed: %s", reason)
 			s.Log.Infof("doEvents: batch failed: %s", reason)
 			ws.WriteJSON(nostr.OKEnvelope{
 				EventID: "",
@@ -658,7 +649,6 @@ func (s *Server) doEvents(
 		if len(disappearingEvents) > 0 {
 			err = s.handleDisappearingMessageList(ctxWithTx, disappearingEvents)
 			if err != nil {
-				txErr = fmt.Errorf("failed to handle disappearing messages: %w", err)
 				s.Log.Errorf("doEvents: failed to handle disappearing messages: %v", err)
 				ws.WriteJSON(nostr.OKEnvelope{
 					EventID: "",
@@ -686,7 +676,6 @@ func (s *Server) doEvents(
 							}
 							continue
 						}
-						txErr = fmt.Errorf("failed to handle group management event %s: %w", evt.ID, err)
 						s.Log.Errorf("doEvents: failed to handle group management event %s: %v", evt.ID, err)
 						ws.WriteJSON(nostr.OKEnvelope{
 							EventID: evt.ID,
@@ -699,8 +688,21 @@ func (s *Server) doEvents(
 			}
 		}
 
-		// If we reach here, all operations succeeded
-		// Send success responses for all events
+		// Commit before sending any OK so clients only get success after durability
+		if commitErr := tx.Commit(); commitErr != nil {
+			s.Log.Errorf("doEvents: failed to commit transaction: %v", commitErr)
+			discardPostCommitBroadcast(tx)
+			ws.WriteJSON(nostr.OKEnvelope{
+				EventID: "",
+				OK:      false,
+				Reason:  "failed to commit transaction",
+			})
+			return ""
+		}
+		committed = true
+		flushPostCommitBroadcast(tx, s.relay)
+
+		// If we reach here, all operations succeeded and commit finished
 		for _, evt := range events {
 			ws.WriteJSON(nostr.OKEnvelope{EventID: evt.ID, OK: true, Reason: okReason})
 		}
@@ -710,7 +712,6 @@ func (s *Server) doEvents(
 			OK:      true,
 			Reason:  "batch processed",
 		})
-		// txErr remains nil, so defer will commit the transaction
 		return ""
 	}
 
