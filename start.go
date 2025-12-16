@@ -49,6 +49,8 @@ type Server struct {
 	serveMux   *http.ServeMux
 	httpServer *http.Server
 	dbSem      chan struct{}
+
+	httpQueryConfig *httpQueryConfig
 }
 
 func (s *Server) Router() *http.ServeMux {
@@ -69,6 +71,7 @@ func NewServer(relay Relay, opts ...Option) (*Server, error) {
 		clients:  make(map[*websocket.Conn]struct{}),
 		serveMux: &http.ServeMux{},
 		options:  options,
+		httpQueryConfig: newHTTPQueryConfig(),
 	}
 
 	if storage := relay.Storage(context.Background()); storage != nil {

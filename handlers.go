@@ -1,6 +1,8 @@
 package relayer
 
 import (
+	"bytes"
+	"compress/gzip"
 	"context"
 	"crypto/rand"
 	"crypto/sha256"
@@ -14,6 +16,7 @@ import (
 	"runtime"
 	"sort"
 	"strconv"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -1170,41 +1173,152 @@ type QueryResponse struct {
 	Data []*nostr.Event  `json:"data"`
 }
 
+const (
+	httpDefaultFilterLimit   = 5000   // default limit per filter when client omits it
+	httpMaxEvents            = 500000 // total events allowed in one HTTP response
+	httpMaxResponseSizeBytes = 50 * 1024 * 1024
+	httpMaxFiltersDefault    = 0 // 0 表示不限制 filter 数量
+)
+
+// HTTPQueryLimits is the public shape used to read/update HTTP query caps.
+type HTTPQueryLimits struct {
+	DefaultFilterLimit int `json:"default_filter_limit"`
+	MaxEvents          int `json:"max_events"`
+	MaxResponseBytes   int `json:"max_response_bytes"`
+	MaxFilters         int `json:"max_filters"` // 0 or negative means unlimited
+}
+
+type httpQueryConfig struct {
+	defaultFilterLimit atomic.Int64
+	maxEvents          atomic.Int64
+	maxResponseBytes   atomic.Int64
+	maxFilters         atomic.Int64
+}
+
+func newHTTPQueryConfig() *httpQueryConfig {
+	cfg := &httpQueryConfig{}
+	cfg.set(HTTPQueryLimits{
+		DefaultFilterLimit: httpDefaultFilterLimit,
+		MaxEvents:          httpMaxEvents,
+		MaxResponseBytes:   httpMaxResponseSizeBytes,
+		MaxFilters:         httpMaxFiltersDefault,
+	})
+	return cfg
+}
+
+func (c *httpQueryConfig) set(limits HTTPQueryLimits) {
+	if limits.DefaultFilterLimit > 0 {
+		c.defaultFilterLimit.Store(int64(limits.DefaultFilterLimit))
+	}
+	if limits.MaxEvents > 0 {
+		c.maxEvents.Store(int64(limits.MaxEvents))
+	}
+	if limits.MaxResponseBytes > 0 {
+		c.maxResponseBytes.Store(int64(limits.MaxResponseBytes))
+	}
+	// MaxFilters: allow 0 to disable the limit explicitly
+	if limits.MaxFilters >= 0 {
+		c.maxFilters.Store(int64(limits.MaxFilters))
+	}
+}
+
+func (c *httpQueryConfig) snapshot() HTTPQueryLimits {
+	return HTTPQueryLimits{
+		DefaultFilterLimit: int(c.defaultFilterLimit.Load()),
+		MaxEvents:          int(c.maxEvents.Load()),
+		MaxResponseBytes:   int(c.maxResponseBytes.Load()),
+		MaxFilters:         int(c.maxFilters.Load()),
+	}
+}
+
+// SetHTTPQueryLimits updates the dynamic HTTP query limits at runtime.
+func (s *Server) SetHTTPQueryLimits(limits HTTPQueryLimits) {
+	if s.httpQueryConfig == nil {
+		return
+	}
+	s.httpQueryConfig.set(limits)
+}
+
+// HTTPQueryLimits returns a snapshot of the current HTTP query limits.
+func (s *Server) HTTPQueryLimits() HTTPQueryLimits {
+	if s.httpQueryConfig == nil {
+		return HTTPQueryLimits{
+			DefaultFilterLimit: httpDefaultFilterLimit,
+			MaxEvents:          httpMaxEvents,
+			MaxResponseBytes:   httpMaxResponseSizeBytes,
+			MaxFilters:         httpMaxFiltersDefault,
+		}
+	}
+	return s.httpQueryConfig.snapshot()
+}
+
+// HandleHTTPQueryConfig exposes GET/POST to inspect or adjust HTTP query limits dynamically.
+// Mount it on a private path and protect it upstream if needed.
+func (s *Server) HandleHTTPQueryConfig(w http.ResponseWriter, req *http.Request) {
+	switch req.Method {
+	case http.MethodGet:
+		w.Header().Set("Content-Type", "application/json; charset=utf-8")
+		json.NewEncoder(w).Encode(s.HTTPQueryLimits())
+	case http.MethodPost:
+		var incoming HTTPQueryLimits
+		if err := json.NewDecoder(req.Body).Decode(&incoming); err != nil {
+			http.Error(w, "invalid JSON body: "+err.Error(), http.StatusBadRequest)
+			return
+		}
+		s.SetHTTPQueryLimits(incoming)
+		w.WriteHeader(http.StatusNoContent)
+	default:
+		w.WriteHeader(http.StatusMethodNotAllowed)
+	}
+}
+
 func (s *Server) HandleHttpReq(w http.ResponseWriter, req *http.Request, store eventstore.Store) {
-    // 设置请求超时
-    ctx, cancel := context.WithTimeout(req.Context(), 60*time.Second)
-    defer cancel()
-    
-    // 尝试从请求头中获取用户 pubkey 并添加到 context
-    if userPubkey := req.Header.Get("pubkey"); userPubkey != "" {
-        ctx = context.WithValue(ctx, "userPubkey", userPubkey)
-        s.Log.Infof("HTTP request with user pubkey: %s", userPubkey)
-    }
-    
-    // 统一的错误响应函数
-    sendErrorResponse := func(errorMsg string, httpStatus int) {
-        response := QueryResponse{
-            Code: -1,  // 错误状态码
-            Msg:  errorMsg,
-            Data: make([]*nostr.Event, 0),  // 确保是空数组而不是 nil
-        }
-        
-        w.Header().Set("Content-Type", "application/json; charset=utf-8")
-        w.Header().Set("Cache-Control", "no-cache")
-        w.WriteHeader(httpStatus)
-        
-        if err := json.NewEncoder(w).Encode(response); err != nil {
-            s.Log.Errorf("failed to encode error response: %v", err)
-            // 最后的兜底，直接写入简单的错误 JSON
-            w.Write([]byte(`{"code":-1,"msg":"internal error: failed to serialize error response","data":[]}`))
-        }
-        s.Log.Errorf("HTTP request failed: %s", errorMsg)
-    }
-    
-    if store == nil {
-        sendErrorResponse("no store available", http.StatusInternalServerError)
-        return
-    }
+
+	limits := s.HTTPQueryLimits()
+	// 兜底，防止被设置成非正值导致后续逻辑异常
+	if limits.DefaultFilterLimit <= 0 {
+		limits.DefaultFilterLimit = httpDefaultFilterLimit
+	}
+	if limits.MaxEvents <= 0 {
+		limits.MaxEvents = httpMaxEvents
+	}
+	if limits.MaxResponseBytes <= 0 {
+		limits.MaxResponseBytes = httpMaxResponseSizeBytes
+	}
+	if limits.MaxFilters < 0 {
+		limits.MaxFilters = httpMaxFiltersDefault
+	}
+
+	// 尝试从请求头中获取用户 pubkey 并添加到 context
+	if userPubkey := req.Header.Get("pubkey"); userPubkey != "" {
+		ctx = context.WithValue(ctx, "userPubkey", userPubkey)
+		s.Log.Infof("HTTP request with user pubkey: %s", userPubkey)
+	}
+
+	// 统一的错误响应函数
+	sendErrorResponse := func(errorMsg string, httpStatus int) {
+		response := QueryResponse{
+			Code: -1, // 错误状态码
+			Msg:  errorMsg,
+			Data: make([]*nostr.Event, 0), // 确保是空数组而不是 nil
+		}
+
+		w.Header().Set("Content-Type", "application/json; charset=utf-8")
+		w.Header().Set("Cache-Control", "no-cache")
+		w.WriteHeader(httpStatus)
+
+		if err := json.NewEncoder(w).Encode(response); err != nil {
+			s.Log.Errorf("failed to encode error response: %v", err)
+			// 最后的兜底，直接写入简单的错误 JSON
+			w.Write([]byte(`{"code":-1,"msg":"internal error: failed to serialize error response","data":[]}`))
+		}
+		s.Log.Errorf("HTTP request failed: %s", errorMsg)
+	}
+
+	if store == nil {
+		sendErrorResponse("no store available", http.StatusInternalServerError)
+		return
+	}
 
     var reqBody struct {
         Filters []json.RawMessage `json:"filters"`
@@ -1214,9 +1328,14 @@ func (s *Server) HandleHttpReq(w http.ResponseWriter, req *http.Request, store e
         return
     }
 
-    // 解析 filters 并检查 limit 逻辑（参考 doReq）
-    filters := make(nostr.Filters, len(reqBody.Filters))
-    limitZeroFlags := make([]bool, len(filters))
+	// 解析 filters 并检查 limit 逻辑（参考 doReq）
+	filters := make(nostr.Filters, len(reqBody.Filters))
+	limitZeroFlags := make([]bool, len(filters))
+
+	if limits.MaxFilters > 0 && len(reqBody.Filters) > limits.MaxFilters {
+		sendErrorResponse(fmt.Sprintf("too many filters: %d > %d", len(reqBody.Filters), limits.MaxFilters), http.StatusRequestEntityTooLarge)
+		return
+	}
 
     for i, filterReq := range reqBody.Filters {
         var raw map[string]json.RawMessage
@@ -1237,12 +1356,11 @@ func (s *Server) HandleHttpReq(w http.ResponseWriter, req *http.Request, store e
         }
     }
 
-    // 收集所有事件到内存中（非流式）
-    var allEvents []*nostr.Event = make([]*nostr.Event, 0)  // 确保初始化为空切片而不是 nil
-    totalEventCount := 0
-    const MAX_EVENTS = 100000
-    
-    // 处理每个 filter（参考 doReq 的逻辑）
+	// 收集所有事件到内存中（非流式）
+	var allEvents []*nostr.Event = make([]*nostr.Event, 0) // 确保初始化为空切片而不是 nil
+	totalEventCount := 0
+
+	// 处理每个 filter（参考 doReq 的逻辑）
 filterLoop:
     for idx, filter := range filters {
         // 检查上下文是否已取消
@@ -1259,14 +1377,9 @@ filterLoop:
         }
         
         // 应用与 doReq 相同的 limit 逻辑
-        if filter.Limit == 0 {
-            filter.Limit = 1000  // 进一步降低默认值到 1000
-        }
-        
-        // 限制单个 filter 最大 1000 条
-        if filter.Limit > 1000 {
-            filter.Limit = 1000
-        }
+		if filter.Limit == 0 {
+			filter.Limit = limits.DefaultFilterLimit
+		}
         
         events, err := store.QueryEvents(ctx, filter)
         if err != nil {
@@ -1302,8 +1415,8 @@ filterLoop:
             }
             
             // 检查总数限制
-            if totalEventCount >= MAX_EVENTS {
-                s.Log.Infof("reached max events limit (%d), stopping", MAX_EVENTS)
+			if totalEventCount >= limits.MaxEvents {
+				s.Log.Infof("reached max events limit (%d), stopping", limits.MaxEvents)
                 // 耗尽剩余的 channel
                 for range events {
                 }
@@ -1322,7 +1435,7 @@ filterLoop:
         allEvents = append(allEvents, filterEvents...)
         
         // 检查是否应该停止
-        if totalEventCount >= MAX_EVENTS {
+		if totalEventCount >= limits.MaxEvents {
             break filterLoop
         }
     }
@@ -1350,14 +1463,13 @@ filterLoop:
         return
     }
     
-    // 检查响应大小，如果太大则分批返回
-    const MAX_RESPONSE_SIZE = 5 * 1024 * 1024  // 降低到 5MB 限制
-    if len(responseBytes) > MAX_RESPONSE_SIZE {
+	// 检查响应大小，如果太大则分批返回（对未压缩数据限额）
+	if len(responseBytes) > limits.MaxResponseBytes {
         s.Log.Warningf("response too large: %d bytes, truncating to first events", len(responseBytes))
         
         // 如果响应太大，逐步减少事件数量直到响应大小合适
         maxEvents := len(allEvents) / 2
-        for maxEvents > 100 && len(responseBytes) > MAX_RESPONSE_SIZE {
+		for maxEvents > 100 && len(responseBytes) > limits.MaxResponseBytes {
             truncatedResponse := QueryResponse{
                 Code: 0,
                 Msg:  fmt.Sprintf("getEventsSuccess (%d events, truncated from %d)", maxEvents, len(allEvents)),
@@ -1372,20 +1484,41 @@ filterLoop:
             maxEvents = maxEvents / 2
         }
         
-        if len(responseBytes) > MAX_RESPONSE_SIZE {
+		if len(responseBytes) > limits.MaxResponseBytes {
             s.Log.Errorf("unable to reduce response size below limit")
             sendErrorResponse("response too large, unable to reduce size", http.StatusRequestEntityTooLarge)
             return
         }
     }
-    
-    s.Log.Infof("sending response: %d events, %d bytes", len(allEvents), len(responseBytes))
+
+	useGzip := strings.Contains(strings.ToLower(req.Header.Get("Accept-Encoding")), "gzip")
+	body := responseBytes
+	originalSize := len(responseBytes)
+
+	if useGzip {
+		var buf bytes.Buffer
+		gz := gzip.NewWriter(&buf)
+		if _, err := gz.Write(responseBytes); err != nil {
+			s.Log.Errorf("failed to gzip response: %v", err)
+			sendErrorResponse("failed to compress response: "+err.Error(), http.StatusInternalServerError)
+			return
+		}
+		if err := gz.Close(); err != nil {
+			s.Log.Errorf("failed to finalize gzip response: %v", err)
+			sendErrorResponse("failed to finalize compressed response: "+err.Error(), http.StatusInternalServerError)
+			return
+		}
+		body = buf.Bytes()
+		w.Header().Set("Content-Encoding", "gzip")
+	}
+
+	s.Log.Infof("sending response: %d events, %d bytes (raw %d)", len(allEvents), len(body), originalSize)
     
     // 设置 Content-Length 头部
-    w.Header().Set("Content-Length", fmt.Sprintf("%d", len(responseBytes)))
+	w.Header().Set("Content-Length", fmt.Sprintf("%d", len(body)))
     
     // 分块写入大响应，避免 I/O 超时
-    const CHUNK_SIZE = 16 * 1024  // 减小到 16KB 每块
+	const CHUNK_SIZE = 32 * 1024 // 稍大块以配合 gzip 后体积
     totalWritten := 0
     
     // 设置更长的写入超时（如果支持的话）
@@ -1393,7 +1526,7 @@ filterLoop:
         conn.SetWriteDeadline(time.Now().Add(30 * time.Second))
     }
     
-    for totalWritten < len(responseBytes) {
+	for totalWritten < len(body) {
         // 检查连接是否还活着
         select {
         case <-ctx.Done():
@@ -1403,14 +1536,13 @@ filterLoop:
         }
         
         end := totalWritten + CHUNK_SIZE
-        if end > len(responseBytes) {
-            end = len(responseBytes)
+		if end > len(body) {
+			end = len(body)
         }
         
-        chunkSize := end - totalWritten
-        // s.Log.Infof("writing chunk %d-%d (%d bytes)", totalWritten, end, chunkSize)
-        
-        written, err := w.Write(responseBytes[totalWritten:end])
+		chunkSize := end - totalWritten
+
+		written, err := w.Write(body[totalWritten:end])
         if err != nil {
             s.Log.Errorf("failed to write response chunk at offset %d (chunk size %d): %v", totalWritten, chunkSize, err)
             // 写入失败时，我们已经开始发送响应了，无法再发送错误响应
@@ -1426,7 +1558,7 @@ filterLoop:
         }
         
         // 更长的休息时间，让网络有时间处理
-        if totalWritten < len(responseBytes) {
+		if totalWritten < len(body) {
             time.Sleep(5 * time.Millisecond)
         }
     }
