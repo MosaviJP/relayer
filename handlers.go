@@ -285,7 +285,7 @@ const (
 	pingPeriod = pongWait / 2
 
 	// Maximum message size allowed from peer.
-	maxMessageSize = 5242880
+	maxMessageSize = 524288000
 )
 
 // TODO: consider moving these to Server as config params
