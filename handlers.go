@@ -36,30 +36,30 @@ const traceIDHeader = "X-Amzn-Trace-Id"
 // 简化的关键资源监控计数器 - 专注于活跃资源和性能瓶颈
 var (
 	// 活跃资源计数（创建+1，释放-1）- 用于检测资源泄漏
-	activeGoroutines          int64 // 当前活跃的goroutine数量（包括handleMessage, doReq等）
+	activeGoroutines           int64 // 当前活跃的goroutine数量（包括handleMessage, doReq等）
 	activeWebSocketConnections int64 // 当前活跃的WebSocket连接数
-	activeEventChannels       int64 // 当前活跃的event channel数量
-	activeEventEnvelopes      int64 // 当前活跃的EventEnvelope数量（创建-序列化完成）
-	activeJSONOperations      int64 // 当前活跃的JSON操作数（解析开始+1，完成-1）
-	activeListeners           int64 // 当前活跃的listener数量
-	allListeners              int64 // 所有listener数量（包括所有WebSocket连接的监听器）
-	metricReqDroppedOnClosed  int64 // NEW: 关闭期间丢弃的 REQ
+	activeEventChannels        int64 // 当前活跃的event channel数量
+	activeEventEnvelopes       int64 // 当前活跃的EventEnvelope数量（创建-序列化完成）
+	activeJSONOperations       int64 // 当前活跃的JSON操作数（解析开始+1，完成-1）
+	activeListeners            int64 // 当前活跃的listener数量
+	allListeners               int64 // 所有listener数量（包括所有WebSocket连接的监听器）
+	metricReqDroppedOnClosed   int64 // NEW: 关闭期间丢弃的 REQ
 
-	metricReqNew                 int64 // 新增订阅id
-    metricReqUpdate              int64 // 复用/覆盖同id
-    metricRemovedClose           int64 // CLOSE 导致的移除
-    metricRemovedDisconnect      int64 // 断连清理导致的移除
-    metricRemovedWriteFail       int64 // 写失败清理导致的移除
-    samplerOnce                  sync.Once
+	metricReqNew            int64 // 新增订阅id
+	metricReqUpdate         int64 // 复用/覆盖同id
+	metricRemovedClose      int64 // CLOSE 导致的移除
+	metricRemovedDisconnect int64 // 断连清理导致的移除
+	metricRemovedWriteFail  int64 // 写失败清理导致的移除
+	samplerOnce             sync.Once
 
 	// 内存泄漏检测
-	deadConnections           int64 // 检测到的死连接数（累计）
-	suspiciousGrowthEvents    int64 // 可疑内存增长事件（累计）
-	memoryGrowthRate          int64 // 内存增长率(MB/min)
-	lastHeapSize              int64 // 上次记录的heap大小
-	consecutiveGrowthCycles   int64 // 连续增长周期数
-	
-	monitoringStarted         int32 // 确保监控只启动一次
+	deadConnections         int64 // 检测到的死连接数（累计）
+	suspiciousGrowthEvents  int64 // 可疑内存增长事件（累计）
+	memoryGrowthRate        int64 // 内存增长率(MB/min)
+	lastHeapSize            int64 // 上次记录的heap大小
+	consecutiveGrowthCycles int64 // 连续增长周期数
+
+	monitoringStarted int32 // 确保监控只启动一次
 )
 
 func traceIDFromContext(ctx context.Context) string {
@@ -94,112 +94,112 @@ func (s *Server) StartResourceMonitoring() {
 
 			// —— 订阅核算的基线（只用于等式对账）——
 			var (
-				baseSet								 bool
-				baseSubs, baseReqNew					int64
-				baseRemClose, baseRemDisc, baseRemWF	int64
+				baseSet                              bool
+				baseSubs, baseReqNew                 int64
+				baseRemClose, baseRemDisc, baseRemWF int64
 			)
 
-		for range ticker.C {
-			// 获取活跃资源计数（这些指标帮助检测资源泄漏）
-			activeGoros := atomic.LoadInt64(&activeGoroutines)
-			activeWSConns := atomic.LoadInt64(&activeWebSocketConnections)
-			activeChannels := atomic.LoadInt64(&activeEventChannels)
-			activeEnvelopes := atomic.LoadInt64(&activeEventEnvelopes)
-			activeJSONOps := atomic.LoadInt64(&activeJSONOperations)
-			activeListenersCount := atomic.LoadInt64(&activeListeners)
-			
-			// 资源泄漏检测指标
-			deadConns := atomic.LoadInt64(&deadConnections)
-			suspiciousGrowth := atomic.LoadInt64(&suspiciousGrowthEvents)
-			growthRate := atomic.LoadInt64(&memoryGrowthRate)
-			consecutiveGrowth := atomic.LoadInt64(&consecutiveGrowthCycles)
-			
-			// Global listeners状态监控
-			listenersMutex.Lock()
-			listenersMapSize := len(listeners)
-			totalListenerSubs := 0
-			perWS := make([]int, 0, listenersMapSize)
-			for _, subs := range listeners {
-				n := len(subs)
-				totalListenerSubs += n
-				perWS = append(perWS, n)
-			}
-			listenersMutex.Unlock()
-			
-			// 获取内存统计信息
-			var memStats runtime.MemStats
-			runtime.ReadMemStats(&memStats)
-			
-			// 内存泄漏检测逻辑
-			currentHeapMB := int64(memStats.HeapAlloc / 1024 / 1024)
-			
-			// 计算内存增长率和可疑行为
-			if lastHeapSize > 0 {
-				growthMB := currentHeapMB - lastHeapSize
-				atomic.StoreInt64(&memoryGrowthRate, growthMB) // MB/minute
-				
-				// 检测可疑增长（连续增长且增长过快）
-				if growthMB > 50 { // 每分钟增长超过50MB视为可疑
-					atomic.AddInt64(&suspiciousGrowthEvents, 1)
-					atomic.AddInt64(&consecutiveGrowthCycles, 1)
-				} else if growthMB <= 0 {
-					atomic.StoreInt64(&consecutiveGrowthCycles, 0)
+			for range ticker.C {
+				// 获取活跃资源计数（这些指标帮助检测资源泄漏）
+				activeGoros := atomic.LoadInt64(&activeGoroutines)
+				activeWSConns := atomic.LoadInt64(&activeWebSocketConnections)
+				activeChannels := atomic.LoadInt64(&activeEventChannels)
+				activeEnvelopes := atomic.LoadInt64(&activeEventEnvelopes)
+				activeJSONOps := atomic.LoadInt64(&activeJSONOperations)
+				activeListenersCount := atomic.LoadInt64(&activeListeners)
+
+				// 资源泄漏检测指标
+				deadConns := atomic.LoadInt64(&deadConnections)
+				suspiciousGrowth := atomic.LoadInt64(&suspiciousGrowthEvents)
+				growthRate := atomic.LoadInt64(&memoryGrowthRate)
+				consecutiveGrowth := atomic.LoadInt64(&consecutiveGrowthCycles)
+
+				// Global listeners状态监控
+				listenersMutex.Lock()
+				listenersMapSize := len(listeners)
+				totalListenerSubs := 0
+				perWS := make([]int, 0, listenersMapSize)
+				for _, subs := range listeners {
+					n := len(subs)
+					totalListenerSubs += n
+					perWS = append(perWS, n)
 				}
-			}
-			atomic.StoreInt64(&lastHeapSize, currentHeapMB)
-			
-			// 简化的资源监控输出 - 专注于关键指标
-			// 活跃资源状态（用于检测资源泄漏）
-			log.Printf("NOSTR_RESOURCE_MONITOR active_resources goroutines=%d ws_connections=%d event_channels=%d event_envelopes=%d json_operations=%d listeners=%d, all_listeners=%d", 
-				activeGoros, activeWSConns, activeChannels, activeEnvelopes, activeJSONOps, activeListenersCount, allListeners)
+				listenersMutex.Unlock()
 
-			// 资源泄漏检测报告（关键！）
-			leakWarning := ""
-			if consecutiveGrowth >= 3 {
-				leakWarning = " LEAK_WARNING=true"
-			}
-			log.Printf("NOSTR_RESOURCE_MONITOR leak_detection dead_connections=%d suspicious_growth=%d growth_rate=%dMB/min consecutive_growth=%d%s", 
-				deadConns, suspiciousGrowth, growthRate, consecutiveGrowth, leakWarning)
-			
-			// 内存状态摘要
-			log.Printf("NOSTR_RESOURCE_MONITOR memory heap_alloc=%dMB heap_sys=%dMB heap_objects=%d gc_runs=%d total_goroutines=%d listeners_map_size=%d total_subscriptions=%d", 
-				memStats.HeapAlloc/1024/1024, memStats.HeapSys/1024/1024, memStats.HeapObjects, memStats.NumGC, runtime.NumGoroutine(), listenersMapSize, totalListenerSubs)
+				// 获取内存统计信息
+				var memStats runtime.MemStats
+				runtime.ReadMemStats(&memStats)
 
-			// ===== 新增：订阅核算（只打点，不改业务）=====
-			// 分位数（锁外计算）
-			p50, p95, pMax := subsDistStats(perWS)
+				// 内存泄漏检测逻辑
+				currentHeapMB := int64(memStats.HeapAlloc / 1024 / 1024)
 
-			// 读取累计计数器
-			reqNew := atomic.LoadInt64(&metricReqNew)
-			reqUpd := atomic.LoadInt64(&metricReqUpdate)
-			remClose := atomic.LoadInt64(&metricRemovedClose)
-			remDisc := atomic.LoadInt64(&metricRemovedDisconnect)
-			remWF := atomic.LoadInt64(&metricRemovedWriteFail)
+				// 计算内存增长率和可疑行为
+				if lastHeapSize > 0 {
+					growthMB := currentHeapMB - lastHeapSize
+					atomic.StoreInt64(&memoryGrowthRate, growthMB) // MB/minute
 
-			// 初始化基线（只执行一次）
-			if !baseSet {
-				baseSet = true
-				baseSubs = int64(totalListenerSubs)
-				baseReqNew = reqNew
-				baseRemClose = remClose
-				baseRemDisc = remDisc
-				baseRemWF = remWF
-			}
+					// 检测可疑增长（连续增长且增长过快）
+					if growthMB > 50 { // 每分钟增长超过50MB视为可疑
+						atomic.AddInt64(&suspiciousGrowthEvents, 1)
+						atomic.AddInt64(&consecutiveGrowthCycles, 1)
+					} else if growthMB <= 0 {
+						atomic.StoreInt64(&consecutiveGrowthCycles, 0)
+					}
+				}
+				atomic.StoreInt64(&lastHeapSize, currentHeapMB)
 
-			expected := baseSubs +
-				(reqNew - baseReqNew) -
-				((remClose - baseRemClose) + (remDisc - baseRemDisc) + (remWF - baseRemWF))
-			diff := int64(totalListenerSubs) - expected
+				// 简化的资源监控输出 - 专注于关键指标
+				// 活跃资源状态（用于检测资源泄漏）
+				log.Printf("NOSTR_RESOURCE_MONITOR active_resources goroutines=%d ws_connections=%d event_channels=%d event_envelopes=%d json_operations=%d listeners=%d, all_listeners=%d",
+					activeGoros, activeWSConns, activeChannels, activeEnvelopes, activeJSONOps, activeListenersCount, allListeners)
 
-			// 对账日志：恒等式是否闭合、订阅分布是否“重订阅化”
-			log.Printf("NOSTR_SUBS_ACCOUNTING subs_total_gauge=%d listeners_map_size=%d ws_connections=%d "+
-				"req_new=%d req_update=%d rem_close=%d rem_disconnect=%d rem_writefail=%d "+
-				"expected_subs=%d diff=%d subs_per_ws_p50=%d subs_per_ws_p95=%d subs_per_ws_max=%d",
-				totalListenerSubs, listenersMapSize, activeWSConns,
-				reqNew, reqUpd, remClose, remDisc, remWF,
-				expected, diff, p50, p95, pMax)
+				// 资源泄漏检测报告（关键！）
+				leakWarning := ""
+				if consecutiveGrowth >= 3 {
+					leakWarning = " LEAK_WARNING=true"
+				}
+				log.Printf("NOSTR_RESOURCE_MONITOR leak_detection dead_connections=%d suspicious_growth=%d growth_rate=%dMB/min consecutive_growth=%d%s",
+					deadConns, suspiciousGrowth, growthRate, consecutiveGrowth, leakWarning)
+
+				// 内存状态摘要
+				log.Printf("NOSTR_RESOURCE_MONITOR memory heap_alloc=%dMB heap_sys=%dMB heap_objects=%d gc_runs=%d total_goroutines=%d listeners_map_size=%d total_subscriptions=%d",
+					memStats.HeapAlloc/1024/1024, memStats.HeapSys/1024/1024, memStats.HeapObjects, memStats.NumGC, runtime.NumGoroutine(), listenersMapSize, totalListenerSubs)
+
+				// ===== 新增：订阅核算（只打点，不改业务）=====
+				// 分位数（锁外计算）
+				p50, p95, pMax := subsDistStats(perWS)
+
+				// 读取累计计数器
+				reqNew := atomic.LoadInt64(&metricReqNew)
+				reqUpd := atomic.LoadInt64(&metricReqUpdate)
+				remClose := atomic.LoadInt64(&metricRemovedClose)
+				remDisc := atomic.LoadInt64(&metricRemovedDisconnect)
+				remWF := atomic.LoadInt64(&metricRemovedWriteFail)
+
+				// 初始化基线（只执行一次）
+				if !baseSet {
+					baseSet = true
+					baseSubs = int64(totalListenerSubs)
+					baseReqNew = reqNew
+					baseRemClose = remClose
+					baseRemDisc = remDisc
+					baseRemWF = remWF
+				}
+
+				expected := baseSubs +
+					(reqNew - baseReqNew) -
+					((remClose - baseRemClose) + (remDisc - baseRemDisc) + (remWF - baseRemWF))
+				diff := int64(totalListenerSubs) - expected
+
+				// 对账日志：恒等式是否闭合、订阅分布是否“重订阅化”
+				log.Printf("NOSTR_SUBS_ACCOUNTING subs_total_gauge=%d listeners_map_size=%d ws_connections=%d "+
+					"req_new=%d req_update=%d rem_close=%d rem_disconnect=%d rem_writefail=%d "+
+					"expected_subs=%d diff=%d subs_per_ws_p50=%d subs_per_ws_p95=%d subs_per_ws_max=%d",
+					totalListenerSubs, listenersMapSize, activeWSConns,
+					reqNew, reqUpd, remClose, remDisc, remWF,
+					expected, diff, p50, p95, pMax)
 				// —— Orphan 订阅检测（只打日志，不改逻辑）——
-				
+
 				// 1) 建立当前活跃底层连接集合（基于 s.clients）
 				s.clientsMu.Lock()
 				wsClients := len(s.clients)
@@ -208,7 +208,7 @@ func (s *Server) StartResourceMonitoring() {
 					activeConns[c] = struct{}{}
 				}
 				s.clientsMu.Unlock()
-				
+
 				// 2) 对比 listeners 里的 ws.conn 是否仍在 activeConns
 				listenersMutex.Lock()
 				orphanWS := 0
@@ -225,17 +225,17 @@ func (s *Server) StartResourceMonitoring() {
 					subTotal += len(subs)
 				}
 				listenersMutex.Unlock()
-				
+
 				avgSubsPerWS := 0.0
 				if lmSize > 0 {
 					avgSubsPerWS = float64(subTotal) / float64(lmSize)
 				}
-				
+
 				// 3) 打一行独立日志，用于定位“孤儿订阅”
 				log.Printf("NOSTR_ORPHANS listeners_map_size=%d ws_clients=%d ws_connections_counter=%d "+
-				"orphans_ws=%d orphan_subs=%d avg_subs_per_ws=%.2f",
-				lmSize, wsClients, atomic.LoadInt64(&activeWebSocketConnections),
-				orphanWS, orphanSubs, avgSubsPerWS)	
+					"orphans_ws=%d orphan_subs=%d avg_subs_per_ws=%.2f",
+					lmSize, wsClients, atomic.LoadInt64(&activeWebSocketConnections),
+					orphanWS, orphanSubs, avgSubsPerWS)
 
 				// 可选：受控清孤儿（把历史存量清掉，方便观察新的竞态是否还发生）
 				if orphanWS > 0 {
@@ -270,7 +270,9 @@ func (s *Server) StartResourceMonitoring() {
 						if _, ok := activeConns[ws.conn]; !ok {
 							log.Printf("NOSTR_ORPHAN_SAMPLE ws=%p conn=%p subs=%d", ws, ws.conn, len(listeners[ws]))
 							sample++
-							if sample >= 5 { break }
+							if sample >= 5 {
+								break
+							}
 						}
 					}
 					listenersMutex.Unlock()
@@ -558,85 +560,85 @@ func (s *Server) doEvent(ctx context.Context, ws *WebSocket, request []json.RawM
 }
 
 func (s *Server) doEvents(
-    ctx context.Context,
-    ws *WebSocket,
-    request []json.RawMessage,
-    store eventstore.Store,
+	ctx context.Context,
+	ws *WebSocket,
+	request []json.RawMessage,
+	store eventstore.Store,
 ) string {
-    if len(request) < 2 {
+	if len(request) < 2 {
 		fmt.Printf("doEvents: request has less than 2 parameters%s\n", traceSuffix(ctx))
-        ws.WriteJSON(nostr.OKEnvelope{
-            EventID: "",
-            OK:      false,
-            Reason:  "invalid request: missing events array",
-        })
-        return ""
-    }
+		ws.WriteJSON(nostr.OKEnvelope{
+			EventID: "",
+			OK:      false,
+			Reason:  "invalid request: missing events array",
+		})
+		return ""
+	}
 
-    var events []nostr.Event
-    if err := json.Unmarshal(request[1], &events); err != nil {
+	var events []nostr.Event
+	if err := json.Unmarshal(request[1], &events); err != nil {
 		fmt.Printf("doEvents: failed to decode events array: %s%s\n", err.Error(), traceSuffix(ctx))
-        ws.WriteJSON(nostr.OKEnvelope{
-            EventID: "",
-            OK:      false,
-            Reason:  "failed to decode events array: " + err.Error(),
-        })
-        return ""
-    }
+		ws.WriteJSON(nostr.OKEnvelope{
+			EventID: "",
+			OK:      false,
+			Reason:  "failed to decode events array: " + err.Error(),
+		})
+		return ""
+	}
 
 	var disappearingEvents []nostr.Event
 	var groupManagementEvents []nostr.Event
-    for _, evt := range events {
-        // 3.1 计算并验证 ID
-        hash := sha256.Sum256(evt.Serialize())
-        computedID := hex.EncodeToString(hash[:])
-        if computedID != evt.ID {
+	for _, evt := range events {
+		// 3.1 计算并验证 ID
+		hash := sha256.Sum256(evt.Serialize())
+		computedID := hex.EncodeToString(hash[:])
+		if computedID != evt.ID {
 			fmt.Printf("doEvents: invalid event id for %s, computed=%s%s\n", evt.ID, computedID, traceSuffix(ctx))
-            ws.WriteJSON(nostr.OKEnvelope{
-                EventID: "",
-                OK:      false,
-                Reason:  fmt.Sprintf("invalid event id for %s, computed=%s", evt.ID, computedID),
-            })
-            return ""
-        }
+			ws.WriteJSON(nostr.OKEnvelope{
+				EventID: "",
+				OK:      false,
+				Reason:  fmt.Sprintf("invalid event id for %s, computed=%s", evt.ID, computedID),
+			})
+			return ""
+		}
 
-        // 3.2 验签
-        sigOK, err := evt.CheckSignature()
-        if err != nil {
+		// 3.2 验签
+		sigOK, err := evt.CheckSignature()
+		if err != nil {
 			fmt.Printf("doEvents: failed to verify signature for %s: %s%s\n", evt.ID, err.Error(), traceSuffix(ctx))
-            ws.WriteJSON(nostr.OKEnvelope{
-                EventID: evt.ID,
-                OK:      false,
-                Reason:  "failed to verify signature: " + err.Error(),
-            })
-            return ""
-        } else if !sigOK {
+			ws.WriteJSON(nostr.OKEnvelope{
+				EventID: evt.ID,
+				OK:      false,
+				Reason:  "failed to verify signature: " + err.Error(),
+			})
+			return ""
+		} else if !sigOK {
 			fmt.Printf("doEvents: invalid signature for %s%s\n", evt.ID, traceSuffix(ctx))
-            ws.WriteJSON(nostr.OKEnvelope{
-                EventID: evt.ID,
-                OK:      false,
-                Reason:  "invalid signature",
-            })
-            return ""
-        }
+			ws.WriteJSON(nostr.OKEnvelope{
+				EventID: evt.ID,
+				OK:      false,
+				Reason:  "invalid signature",
+			})
+			return ""
+		}
 
-        accept, why := s.relay.AcceptEvent(ctx, &evt)
-        if !accept {
+		accept, why := s.relay.AcceptEvent(ctx, &evt)
+		if !accept {
 			fmt.Printf("doEvents: event rejected by relay: %s%s\n", why, traceSuffix(ctx))
-            ws.WriteJSON(nostr.OKEnvelope{
-                EventID: evt.ID,
-                OK:      false,
-                Reason:  "rejected by relay: " + why,
-            })
-            return ""
-        }
+			ws.WriteJSON(nostr.OKEnvelope{
+				EventID: evt.ID,
+				OK:      false,
+				Reason:  "rejected by relay: " + why,
+			})
+			return ""
+		}
 		if isDisappearingMessage(evt) {
 			disappearingEvents = append(disappearingEvents, evt)
 		}
 		if evt.Kind == 3046 || evt.Kind == 3047 || evt.Kind == 20041 || evt.Kind == 20042 || evt.Kind == 39304 {
 			groupManagementEvents = append(groupManagementEvents, evt)
 		}
-    }
+	}
 
 	// Always use transaction for batch operations when using PostgreSQL backend
 	if postgresBackend, ok := store.(*postgresql.PostgresBackend); ok {
@@ -696,7 +698,9 @@ func (s *Server) doEvents(
 			kindOrder := []int{3046, 3047, 20041, 20042, 39304}
 			for _, k := range kindOrder {
 				for _, evt := range groupManagementEvents {
-					if evt.Kind != k { continue }
+					if evt.Kind != k {
+						continue
+					}
 					if err := s.handleGroupManagementEventInline(ctxWithTx, &evt); err != nil {
 						if errors.Is(err, errBotKeyNotConfigured) || errors.Is(err, errUnsupportedGroupMgmtBackend) {
 							if okReason == "" {
@@ -767,22 +771,22 @@ func (s *Server) doEvents(
 		}
 	}
 
-    for _, evt := range events {
-        if !accepted{
-            ws.WriteJSON(nostr.OKEnvelope{
-                EventID: evt.ID,
-                OK:      accepted,
-                Reason:  fmt.Sprintf("failed to add event: %s", reason),
-            })
-        } else {
-            if (evt.Kind == 3046 || evt.Kind == 3047 || evt.Kind == 20041 || evt.Kind == 20042 || evt.Kind == 39304) && okHint != "" {
-                ws.WriteJSON(nostr.OKEnvelope{EventID: evt.ID, OK: true, Reason: okHint})
-            } else {
-                ws.WriteJSON(nostr.OKEnvelope{EventID: evt.ID, OK: true})
-            }
-        }
-    }
-	
+	for _, evt := range events {
+		if !accepted {
+			ws.WriteJSON(nostr.OKEnvelope{
+				EventID: evt.ID,
+				OK:      accepted,
+				Reason:  fmt.Sprintf("failed to add event: %s", reason),
+			})
+		} else {
+			if (evt.Kind == 3046 || evt.Kind == 3047 || evt.Kind == 20041 || evt.Kind == 20042 || evt.Kind == 39304) && okHint != "" {
+				ws.WriteJSON(nostr.OKEnvelope{EventID: evt.ID, OK: true, Reason: okHint})
+			} else {
+				ws.WriteJSON(nostr.OKEnvelope{EventID: evt.ID, OK: true})
+			}
+		}
+	}
+
 	if !accepted {
 		s.Log.Infof("doEvents: batch failed: %s%s", reason, traceSuffix(ctx))
 		ws.WriteJSON(nostr.OKEnvelope{
@@ -793,13 +797,13 @@ func (s *Server) doEvents(
 		return ""
 	}
 
-    ws.WriteJSON(nostr.OKEnvelope{
-        EventID: "",
-        OK:      true,
-        Reason:  "batch processed",
-    })
+	ws.WriteJSON(nostr.OKEnvelope{
+		EventID: "",
+		OK:      true,
+		Reason:  "batch processed",
+	})
 
-    return ""
+	return ""
 }
 
 func (s *Server) doCount(ctx context.Context, ws *WebSocket, request []json.RawMessage, store eventstore.Store) string {
@@ -839,7 +843,7 @@ func (s *Server) doReq(ctx context.Context, ws *WebSocket, request []json.RawMes
 
 	reqCtx, cancel := context.WithCancel(ctx)
 	defer cancel()
-	
+
 	filterTimeout := 8 * time.Second
 	if v := os.Getenv("RELAY_DB_FILTER_TIMEOUT"); v != "" {
 		if n, err := strconv.Atoi(v); err == nil && n > 0 {
@@ -848,18 +852,18 @@ func (s *Server) doReq(ctx context.Context, ws *WebSocket, request []json.RawMes
 	}
 
 	startTime := time.Now()
-	
+
 	// 活跃goroutine计数
 	atomic.AddInt64(&activeGoroutines, 1)
 	defer atomic.AddInt64(&activeGoroutines, -1)
-	
+
 	var id string
 	json.Unmarshal(request[1], &id)
-	
+
 	// 监控JSON操作
 	atomic.AddInt64(&activeJSONOperations, 1)
 	defer atomic.AddInt64(&activeJSONOperations, -1)
-	
+
 	if id == "" {
 		return "REQ has no <id>"
 	}
@@ -906,20 +910,20 @@ func (s *Server) doReq(ctx context.Context, ws *WebSocket, request []json.RawMes
 	}
 
 	// 并行查询结果结构
-    type filterResult struct {
-        idx         int
-        events      <-chan *nostr.Event
-        err         error
-        filterTime  time.Duration
-        dbQueryTime time.Duration
-        eventCount  int
-        cancel      context.CancelFunc
-    }
+	type filterResult struct {
+		idx         int
+		events      <-chan *nostr.Event
+		err         error
+		filterTime  time.Duration
+		dbQueryTime time.Duration
+		eventCount  int
+		cancel      context.CancelFunc
+	}
 
 	// 启动并行查询
 	var wg sync.WaitGroup
 	results := make([]filterResult, len(filters))
-	
+
 	for idx, filter := range filters {
 		if limitZeroFlags[idx] {
 			results[idx] = filterResult{
@@ -936,18 +940,18 @@ func (s *Server) doReq(ctx context.Context, ws *WebSocket, request []json.RawMes
 		wg.Add(1)
 		go func(idx int, filter nostr.Filter) {
 			defer wg.Done()
-			
+
 			acqStart := time.Now()
 			if s.dbSem != nil {
 				select {
-					case s.dbSem <- struct{}{}:
-					case <-reqCtx.Done():
-						results[idx] = filterResult{idx: idx, events: nil, err: reqCtx.Err()}
-						return
+				case s.dbSem <- struct{}{}:
+				case <-reqCtx.Done():
+					results[idx] = filterResult{idx: idx, events: nil, err: reqCtx.Err()}
+					return
 				}
-				defer func() {<-s.dbSem}()
+				defer func() { <-s.dbSem }()
 			}
-			
+
 			qctx, qcancel := context.WithTimeout(reqCtx, filterTimeout)
 
 			dbStart := time.Now()
@@ -977,7 +981,7 @@ func (s *Server) doReq(ctx context.Context, ws *WebSocket, request []json.RawMes
 			}
 
 			dbDuration := time.Since(dbStart)
-			
+
 			results[idx] = filterResult{
 				idx:         idx,
 				events:      events,
@@ -992,7 +996,7 @@ func (s *Server) doReq(ctx context.Context, ws *WebSocket, request []json.RawMes
 
 	// 等待所有查询完成
 	wg.Wait()
-	
+
 	totalEvents := 0
 	totalDbTime := time.Duration(0)
 
@@ -1003,7 +1007,7 @@ func (s *Server) doReq(ctx context.Context, ws *WebSocket, request []json.RawMes
 		}
 
 		eventProcessStart := time.Now()
-		
+
 		// 如果上面已经因为某个 filter 超时/取消了整个 reqCtx，这里直接退出
 		select {
 		case <-reqCtx.Done():
@@ -1014,7 +1018,9 @@ func (s *Server) doReq(ctx context.Context, ws *WebSocket, request []json.RawMes
 		if result.err != nil {
 			s.Log.Errorf("store: %v%s", result.err, traceSuffix(ctx))
 			results[idx].filterTime = time.Since(eventProcessStart)
-			if result.cancel != nil { result.cancel() }
+			if result.cancel != nil {
+				result.cancel()
+			}
 			continue
 		}
 
@@ -1023,7 +1029,7 @@ func (s *Server) doReq(ctx context.Context, ws *WebSocket, request []json.RawMes
 		if filter.Limit == 0 {
 			filter.Limit = 9999999999
 		}
-		
+
 		eventCount := 0
 		if result.events != nil {
 			for event := range result.events {
@@ -1058,14 +1064,18 @@ func (s *Server) doReq(ctx context.Context, ws *WebSocket, request []json.RawMes
 					go drainEvents(result.events, 3*time.Second)
 
 					// 同时取消当前和后续 filters 的 per-filter 上下文，以尽快终止底层 DB 读取
-					if result.cancel != nil { result.cancel() }
+					if result.cancel != nil {
+						result.cancel()
+					}
 
 					// **把后续 filters 的 events 也丢弃干净**（它们的 channel 已经在 results 里）
 					for j := idx + 1; j < len(results); j++ {
 						if results[j].events != nil {
 							go drainEvents(results[j].events, 3*time.Second)
 						}
-						if results[j].cancel != nil { results[j].cancel() }
+						if results[j].cancel != nil {
+							results[j].cancel()
+						}
 					}
 
 					// 计数 -1 后退出
@@ -1082,8 +1092,10 @@ func (s *Server) doReq(ctx context.Context, ws *WebSocket, request []json.RawMes
 		}
 
 		// 处理完成后，释放该 filter 的超时资源
-		if result.cancel != nil { result.cancel() }
-		
+		if result.cancel != nil {
+			result.cancel()
+		}
+
 		results[idx].eventCount = eventCount
 		results[idx].filterTime = time.Since(eventProcessStart) + result.dbQueryTime
 		totalEvents += eventCount
@@ -1091,7 +1103,7 @@ func (s *Server) doReq(ctx context.Context, ws *WebSocket, request []json.RawMes
 	}
 
 	totalTime := time.Since(startTime)
-	
+
 	// 构建单行时间统计信息
 	filterInfo := ""
 	for i, result := range results {
@@ -1140,27 +1152,27 @@ func (s *Server) doReq(ctx context.Context, ws *WebSocket, request []json.RawMes
 		return ""
 	}
 	setListener(id, ws, filters)
-	
+
 	return ""
 }
 
 // 丢弃并尽快排空一个事件通道，最多等 maxDur（避免卡死）
 func drainEvents(ch <-chan *nostr.Event, maxDur time.Duration) {
-    if ch == nil {
-        return
-    }
-    deadline := time.NewTimer(maxDur)
-    defer deadline.Stop()
-    for {
-        select {
-        case _, ok := <-ch:
-            if !ok {
-                return // 正常关闭
-            }
-        case <-deadline.C:
-            return // 到时放弃
-        }
-    }
+	if ch == nil {
+		return
+	}
+	deadline := time.NewTimer(maxDur)
+	defer deadline.Stop()
+	for {
+		select {
+		case _, ok := <-ch:
+			if !ok {
+				return // 正常关闭
+			}
+		case <-deadline.C:
+			return // 到时放弃
+		}
+	}
 }
 
 func (s *Server) doClose(ctx context.Context, ws *WebSocket, request []json.RawMessage, store eventstore.Store) string {
@@ -1195,9 +1207,9 @@ type FilterRequest struct {
 }
 
 type QueryResponse struct {
-	Code int             `json:"code"`
-	Msg  string          `json:"msg"`
-	Data []*nostr.Event  `json:"data"`
+	Code int            `json:"code"`
+	Msg  string         `json:"msg"`
+	Data []*nostr.Event `json:"data"`
 }
 
 const (
@@ -1309,7 +1321,6 @@ func (s *Server) HandleHTTPQueryConfig(w http.ResponseWriter, req *http.Request)
 }
 
 func (s *Server) HandleHttpReq(w http.ResponseWriter, req *http.Request, store eventstore.Store) {
-
 	limits := s.HTTPQueryLimits()
 	// 兜底，防止被设置成非正值导致后续逻辑异常
 	if limits.DefaultFilterLimit <= 0 {
@@ -1366,13 +1377,13 @@ func (s *Server) HandleHttpReq(w http.ResponseWriter, req *http.Request, store e
 		return
 	}
 
-    var reqBody struct {
-        Filters []json.RawMessage `json:"filters"`
-    }
-    if err := json.NewDecoder(req.Body).Decode(&reqBody); err != nil {
-        sendErrorResponse("invalid request body: "+err.Error(), http.StatusBadRequest)
-        return
-    }
+	var reqBody struct {
+		Filters []json.RawMessage `json:"filters"`
+	}
+	if err := json.NewDecoder(req.Body).Decode(&reqBody); err != nil {
+		sendErrorResponse("invalid request body: "+err.Error(), http.StatusBadRequest)
+		return
+	}
 
 	// 解析 filters 并检查 limit 逻辑（参考 doReq）
 	filters := make(nostr.Filters, len(reqBody.Filters))
@@ -1383,24 +1394,24 @@ func (s *Server) HandleHttpReq(w http.ResponseWriter, req *http.Request, store e
 		return
 	}
 
-    for i, filterReq := range reqBody.Filters {
-        var raw map[string]json.RawMessage
-        if err := json.Unmarshal(filterReq, &raw); err != nil {
-            sendErrorResponse("failed to decode filter: "+err.Error(), http.StatusBadRequest)
-            return
-        }
-        if v, ok := raw["limit"]; ok {
-            var lim int
-            if err := json.Unmarshal(v, &lim); err == nil && lim == 0 {
-                limitZeroFlags[i] = true
-            }
-        }
+	for i, filterReq := range reqBody.Filters {
+		var raw map[string]json.RawMessage
+		if err := json.Unmarshal(filterReq, &raw); err != nil {
+			sendErrorResponse("failed to decode filter: "+err.Error(), http.StatusBadRequest)
+			return
+		}
+		if v, ok := raw["limit"]; ok {
+			var lim int
+			if err := json.Unmarshal(v, &lim); err == nil && lim == 0 {
+				limitZeroFlags[i] = true
+			}
+		}
 
-        if err := json.Unmarshal(filterReq, &filters[i]); err != nil {
-            sendErrorResponse("failed to decode filter: "+err.Error(), http.StatusBadRequest)
-            return
-        }
-    }
+		if err := json.Unmarshal(filterReq, &filters[i]); err != nil {
+			sendErrorResponse("failed to decode filter: "+err.Error(), http.StatusBadRequest)
+			return
+		}
+	}
 
 	// 收集所有事件到内存中（非流式）
 	var allEvents []*nostr.Event = make([]*nostr.Event, 0) // 确保初始化为空切片而不是 nil
@@ -1408,134 +1419,134 @@ func (s *Server) HandleHttpReq(w http.ResponseWriter, req *http.Request, store e
 
 	// 处理每个 filter（参考 doReq 的逻辑）
 filterLoop:
-    for idx, filter := range filters {
-        // 检查上下文是否已取消
-        select {
-        case <-ctx.Done():
+	for idx, filter := range filters {
+		// 检查上下文是否已取消
+		select {
+		case <-ctx.Done():
 			s.Log.Warningf("request timeout at filter %d%s", idx, traceSuffix(ctx))
-            break filterLoop
-        default:
-        }
-        
-        // 如果 limit 为 0，跳过此 filter（参考 doReq）
-        if limitZeroFlags[idx] {
-            continue
-        }
-        
-        // 应用与 doReq 相同的 limit 逻辑
+			break filterLoop
+		default:
+		}
+
+		// 如果 limit 为 0，跳过此 filter（参考 doReq）
+		if limitZeroFlags[idx] {
+			continue
+		}
+
+		// 应用与 doReq 相同的 limit 逻辑
 		if filter.Limit == 0 {
 			filter.Limit = limits.DefaultFilterLimit
 		}
-        
-        events, err := store.QueryEvents(ctx, filter)
-        if err != nil {
-			s.Log.Errorf("query error for filter %d: %v%s", idx, err, traceSuffix(ctx))
-            continue
-        }
 
-        var filterEvents []*nostr.Event
-        filterEventCount := 0
-        for ev := range events {
-            // 检查上下文
-            select {
-            case <-ctx.Done():
+		events, err := store.QueryEvents(ctx, filter)
+		if err != nil {
+			s.Log.Errorf("query error for filter %d: %v%s", idx, err, traceSuffix(ctx))
+			continue
+		}
+
+		var filterEvents []*nostr.Event
+		filterEventCount := 0
+		for ev := range events {
+			// 检查上下文
+			select {
+			case <-ctx.Done():
 				s.Log.Warningf("request timeout while processing events%s", traceSuffix(ctx))
-                // 耗尽剩余的 channel
-                for range events {
-                }
-                break filterLoop
-            default:
-            }
-            
-            // skipEventFunc已在数据库层面处理，无需再次过滤
-            // if s.options.skipEventFunc != nil && s.options.skipEventFunc(ev) {
-            //     continue
-            // }
-            
-            // 检查单个 filter 的 limit
-            if filterEventCount >= filter.Limit {
-                // 耗尽剩余的 channel
-                for range events {
-                }
-                break
-            }
-            
-            // 检查总数限制
+				// 耗尽剩余的 channel
+				for range events {
+				}
+				break filterLoop
+			default:
+			}
+
+			// skipEventFunc已在数据库层面处理，无需再次过滤
+			// if s.options.skipEventFunc != nil && s.options.skipEventFunc(ev) {
+			//     continue
+			// }
+
+			// 检查单个 filter 的 limit
+			if filterEventCount >= filter.Limit {
+				// 耗尽剩余的 channel
+				for range events {
+				}
+				break
+			}
+
+			// 检查总数限制
 			if totalEventCount >= limits.MaxEvents {
 				s.Log.Infof("reached max events limit (%d), stopping%s", limits.MaxEvents, traceSuffix(ctx))
-                // 耗尽剩余的 channel
-                for range events {
-                }
-                break filterLoop
-            }
-            
-            filterEvents = append(filterEvents, ev)
-            filterEventCount++
-            totalEventCount++
-        }
-        
-        // 耗尽 channel 确保清理
-        for range events {
-        }
-        
-        allEvents = append(allEvents, filterEvents...)
-        
-        // 检查是否应该停止
-		if totalEventCount >= limits.MaxEvents {
-            break filterLoop
-        }
-    }
+				// 耗尽剩余的 channel
+				for range events {
+				}
+				break filterLoop
+			}
 
-    // 设置适当的头部
-    w.Header().Set("Content-Type", "application/json; charset=utf-8")
-    w.Header().Set("Cache-Control", "no-cache")
-    
-    // 预先序列化响应以检查大小和有效性
-    // 确保 allEvents 不是 nil，即使为空也要是空切片
-    if allEvents == nil {
-        allEvents = make([]*nostr.Event, 0)
-    }
-    
-    response := QueryResponse{
-        Code: 0,
-        Msg:  fmt.Sprintf("getEventsSuccess (%d events)", len(allEvents)),
-        Data: allEvents,
-    }
-    
-    responseBytes, err := json.Marshal(response)
-    if err != nil {
+			filterEvents = append(filterEvents, ev)
+			filterEventCount++
+			totalEventCount++
+		}
+
+		// 耗尽 channel 确保清理
+		for range events {
+		}
+
+		allEvents = append(allEvents, filterEvents...)
+
+		// 检查是否应该停止
+		if totalEventCount >= limits.MaxEvents {
+			break filterLoop
+		}
+	}
+
+	// 设置适当的头部
+	w.Header().Set("Content-Type", "application/json; charset=utf-8")
+	w.Header().Set("Cache-Control", "no-cache")
+
+	// 预先序列化响应以检查大小和有效性
+	// 确保 allEvents 不是 nil，即使为空也要是空切片
+	if allEvents == nil {
+		allEvents = make([]*nostr.Event, 0)
+	}
+
+	response := QueryResponse{
+		Code: 0,
+		Msg:  fmt.Sprintf("getEventsSuccess (%d events)", len(allEvents)),
+		Data: allEvents,
+	}
+
+	responseBytes, err := json.Marshal(response)
+	if err != nil {
 		s.Log.Errorf("failed to marshal response: %v%s", err, traceSuffix(ctx))
-        sendErrorResponse("failed to serialize response: "+err.Error(), http.StatusInternalServerError)
-        return
-    }
-    
+		sendErrorResponse("failed to serialize response: "+err.Error(), http.StatusInternalServerError)
+		return
+	}
+
 	// 检查响应大小，如果太大则分批返回（对未压缩数据限额）
 	if len(responseBytes) > limits.MaxResponseBytes {
 		s.Log.Warningf("response too large: %d bytes, truncating to first events%s", len(responseBytes), traceSuffix(ctx))
-        
-        // 如果响应太大，逐步减少事件数量直到响应大小合适
-        maxEvents := len(allEvents) / 2
+
+		// 如果响应太大，逐步减少事件数量直到响应大小合适
+		maxEvents := len(allEvents) / 2
 		for maxEvents > 100 && len(responseBytes) > limits.MaxResponseBytes {
-            truncatedResponse := QueryResponse{
-                Code: 0,
-                Msg:  fmt.Sprintf("getEventsSuccess (%d events, truncated from %d)", maxEvents, len(allEvents)),
-                Data: allEvents[:maxEvents],
-            }
-            responseBytes, err = json.Marshal(truncatedResponse)
-            if err != nil {
+			truncatedResponse := QueryResponse{
+				Code: 0,
+				Msg:  fmt.Sprintf("getEventsSuccess (%d events, truncated from %d)", maxEvents, len(allEvents)),
+				Data: allEvents[:maxEvents],
+			}
+			responseBytes, err = json.Marshal(truncatedResponse)
+			if err != nil {
 				s.Log.Errorf("failed to marshal truncated response: %v%s", err, traceSuffix(ctx))
-                sendErrorResponse("failed to serialize truncated response: "+err.Error(), http.StatusInternalServerError)
-                return
-            }
-            maxEvents = maxEvents / 2
-        }
-        
+				sendErrorResponse("failed to serialize truncated response: "+err.Error(), http.StatusInternalServerError)
+				return
+			}
+			maxEvents = maxEvents / 2
+		}
+
 		if len(responseBytes) > limits.MaxResponseBytes {
 			s.Log.Errorf("unable to reduce response size below limit%s", traceSuffix(ctx))
-            sendErrorResponse("response too large, unable to reduce size", http.StatusRequestEntityTooLarge)
-            return
-        }
-    }
+			sendErrorResponse("response too large, unable to reduce size", http.StatusRequestEntityTooLarge)
+			return
+		}
+	}
 
 	useGzip := strings.Contains(strings.ToLower(req.Header.Get("Accept-Encoding")), "gzip")
 	body := responseBytes
@@ -1559,56 +1570,56 @@ filterLoop:
 	}
 
 	s.Log.Infof("sending response: %d events, %d bytes (raw %d)%s", len(allEvents), len(body), originalSize, traceSuffix(ctx))
-    
-    // 设置 Content-Length 头部
+
+	// 设置 Content-Length 头部
 	w.Header().Set("Content-Length", fmt.Sprintf("%d", len(body)))
-    
-    // 分块写入大响应，避免 I/O 超时
+
+	// 分块写入大响应，避免 I/O 超时
 	const CHUNK_SIZE = 32 * 1024 // 稍大块以配合 gzip 后体积
-    totalWritten := 0
-    
-    // 设置更长的写入超时（如果支持的话）
-    if conn, ok := w.(interface{ SetWriteDeadline(time.Time) error }); ok {
-        conn.SetWriteDeadline(time.Now().Add(30 * time.Second))
-    }
-    
+	totalWritten := 0
+
+	// 设置更长的写入超时（如果支持的话）
+	if conn, ok := w.(interface{ SetWriteDeadline(time.Time) error }); ok {
+		conn.SetWriteDeadline(time.Now().Add(30 * time.Second))
+	}
+
 	for totalWritten < len(body) {
-        // 检查连接是否还活着
-        select {
-        case <-ctx.Done():
+		// 检查连接是否还活着
+		select {
+		case <-ctx.Done():
 			s.Log.Warningf("client disconnected during response writing at %d/%d bytes%s", totalWritten, len(body), traceSuffix(ctx))
-            return
-        default:
-        }
-        
-        end := totalWritten + CHUNK_SIZE
+			return
+		default:
+		}
+
+		end := totalWritten + CHUNK_SIZE
 		if end > len(body) {
 			end = len(body)
-        }
-        
+		}
+
 		chunkSize := end - totalWritten
 
 		written, err := w.Write(body[totalWritten:end])
-        if err != nil {
+		if err != nil {
 			s.Log.Errorf("failed to write response chunk at offset %d (chunk size %d): %v%s", totalWritten, chunkSize, err, traceSuffix(ctx))
-            // 写入失败时，我们已经开始发送响应了，无法再发送错误响应
-            // 只能记录错误并返回，客户端会收到不完整的响应
-            return
-        }
-        
-        totalWritten += written
-        
-        // 强制 flush 确保数据发送
-        if flusher, ok := w.(http.Flusher); ok {
-            flusher.Flush()
-        }
-        
-        // 更长的休息时间，让网络有时间处理
+			// 写入失败时，我们已经开始发送响应了，无法再发送错误响应
+			// 只能记录错误并返回，客户端会收到不完整的响应
+			return
+		}
+
+		totalWritten += written
+
+		// 强制 flush 确保数据发送
+		if flusher, ok := w.(http.Flusher); ok {
+			flusher.Flush()
+		}
+
+		// 更长的休息时间，让网络有时间处理
 		if totalWritten < len(body) {
-            time.Sleep(5 * time.Millisecond)
-        }
-    }
-    
+			time.Sleep(5 * time.Millisecond)
+		}
+	}
+
 	s.Log.Infof("HTTP query completed successfully: %d events, %d bytes written%s", len(allEvents), totalWritten, traceSuffix(ctx))
 }
 func (s *Server) handleMessage(ctx context.Context, ws *WebSocket, message []byte, defaultStore eventstore.Store) {
@@ -1622,7 +1633,7 @@ func (s *Server) handleMessage(ctx context.Context, ws *WebSocket, message []byt
 	// JSON操作监控 - handleMessage开始
 	atomic.AddInt64(&activeGoroutines, 1)
 	defer atomic.AddInt64(&activeGoroutines, -1)
-	
+
 	atomic.AddInt64(&activeJSONOperations, 1)
 	defer atomic.AddInt64(&activeJSONOperations, -1)
 
@@ -1683,7 +1694,7 @@ func (s *Server) HandleWebsocket(w http.ResponseWriter, r *http.Request) {
 		s.Log.Errorf("failed to upgrade websocket: %v%s", err, traceLogSuffix)
 		return
 	}
-	
+
 	s.clientsMu.Lock()
 	s.clients[conn] = struct{}{}
 	clientCount := len(s.clients)

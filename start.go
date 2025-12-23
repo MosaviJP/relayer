@@ -66,11 +66,11 @@ func NewServer(relay Relay, opts ...Option) (*Server, error) {
 	}
 
 	srv := &Server{
-		Log:      defaultLogger(relay.Name() + ": "),
-		relay:    relay,
-		clients:  make(map[*websocket.Conn]struct{}),
-		serveMux: &http.ServeMux{},
-		options:  options,
+		Log:             defaultLogger(relay.Name() + ": "),
+		relay:           relay,
+		clients:         make(map[*websocket.Conn]struct{}),
+		serveMux:        &http.ServeMux{},
+		options:         options,
 		httpQueryConfig: newHTTPQueryConfig(),
 	}
 
