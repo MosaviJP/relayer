@@ -30,6 +30,9 @@ import (
 	"golang.org/x/time/rate"
 )
 
+const traceIDContextKey = "amzn-trace-id"
+const traceIDHeader = "X-Amzn-Trace-Id"
+
 // 简化的关键资源监控计数器 - 专注于活跃资源和性能瓶颈
 var (
 	// 活跃资源计数（创建+1，释放-1）- 用于检测资源泄漏
@@ -58,6 +61,30 @@ var (
 	
 	monitoringStarted         int32 // 确保监控只启动一次
 )
+
+func traceIDFromContext(ctx context.Context) string {
+	if ctx == nil {
+		return ""
+	}
+	if v := ctx.Value(traceIDContextKey); v != nil {
+		if s, ok := v.(string); ok {
+			return s
+		}
+	}
+	return ""
+}
+
+func traceSuffixFromID(traceID string) string {
+	if traceID == "" {
+		return ""
+	}
+	return " trace_id=" + traceID
+}
+
+func traceSuffix(ctx context.Context) string {
+	return traceSuffixFromID(traceIDFromContext(ctx))
+}
+
 // StartResourceMonitoring 启动简化的资源监控goroutine（导出函数供外部调用）
 func (s *Server) StartResourceMonitoring() {
 	if atomic.CompareAndSwapInt32(&monitoringStarted, 0, 1) {
@@ -350,7 +377,7 @@ func (s *Server) doEvent(ctx context.Context, ws *WebSocket, request []json.RawM
 				discardPostCommitBroadcast(tx)
 			} else {
 				if commitErr := tx.Commit(); commitErr != nil {
-					s.Log.Errorf("failed to commit transaction for event %s: %v", evt.ID, commitErr)
+					s.Log.Errorf("failed to commit transaction for event %s: %v%s", evt.ID, commitErr, traceSuffix(ctx))
 					// avoid leaking queued events if commit fails
 					discardPostCommitBroadcast(tx)
 				} else {
@@ -377,7 +404,7 @@ func (s *Server) doEvent(ctx context.Context, ws *WebSocket, request []json.RawM
 		if isDisappearingMessage(evt) {
 			if err := s.handleDisappearingMessage(ctxWithTx, evt); err != nil {
 				txErr = fmt.Errorf("failed to handle disappearing message: %w", err)
-				s.Log.Errorf("failed to handle disappearing message %s: %v", evt.ID, err)
+				s.Log.Errorf("failed to handle disappearing message %s: %v%s", evt.ID, err, traceSuffix(ctx))
 				ws.WriteJSON(nostr.OKEnvelope{EventID: evt.ID, OK: false, Reason: "failed to handle disappearing message"})
 				return ""
 			}
@@ -393,7 +420,7 @@ func (s *Server) doEvent(ctx context.Context, ws *WebSocket, request []json.RawM
 					}
 				} else {
 					txErr = fmt.Errorf("failed to handle group management event: %w", err)
-					s.Log.Errorf("failed to handle group management event %s: %v", evt.ID, err)
+					s.Log.Errorf("failed to handle group management event %s: %v%s", evt.ID, err, traceSuffix(ctx))
 					ws.WriteJSON(nostr.OKEnvelope{EventID: evt.ID, OK: false, Reason: "failed to handle group management"})
 					return ""
 				}
@@ -458,9 +485,9 @@ func (s *Server) doEvent(ctx context.Context, ws *WebSocket, request []json.RawM
 	// Fallback for non-PostgreSQL backends
 	if isDisappearingMessage(evt) {
 		if err := s.handleDisappearingMessage(ctx, evt); err != nil {
-			s.Log.Errorf("failed to handle disappearing message %s: %v", evt.ID, err)
+			s.Log.Errorf("failed to handle disappearing message %s: %v%s", evt.ID, err, traceSuffix(ctx))
 		} else {
-			s.Log.Infof("successfully processed disappearing message %s", evt.ID)
+			s.Log.Infof("successfully processed disappearing message %s%s", evt.ID, traceSuffix(ctx))
 		}
 	} else if evt.Kind == 5 {
 		// event deletion -- nip09
@@ -511,9 +538,9 @@ func (s *Server) doEvent(ctx context.Context, ws *WebSocket, request []json.RawM
 	}
 
 	if ctx == nil {
-		fmt.Printf("doEvent: context is nil for event %s\n", evt.ID)
+		fmt.Printf("doEvent: context is nil for event %s%s\n", evt.ID, traceSuffix(ctx))
 	} else if ctx.Err() != nil {
-		fmt.Printf("doEvent: context error for event %s: %v\n", evt.ID, ctx.Err())
+		fmt.Printf("doEvent: context error for event %s: %v%s\n", evt.ID, ctx.Err(), traceSuffix(ctx))
 	}
 
 	ok, reason := AddEvent(ctx, s.relay, &evt)
@@ -537,7 +564,7 @@ func (s *Server) doEvents(
     store eventstore.Store,
 ) string {
     if len(request) < 2 {
-		println("doEvents: request has less than 2 parameters")
+		fmt.Printf("doEvents: request has less than 2 parameters%s\n", traceSuffix(ctx))
         ws.WriteJSON(nostr.OKEnvelope{
             EventID: "",
             OK:      false,
@@ -548,7 +575,7 @@ func (s *Server) doEvents(
 
     var events []nostr.Event
     if err := json.Unmarshal(request[1], &events); err != nil {
-        println("doEvents: failed to decode events array: " + err.Error())
+		fmt.Printf("doEvents: failed to decode events array: %s%s\n", err.Error(), traceSuffix(ctx))
         ws.WriteJSON(nostr.OKEnvelope{
             EventID: "",
             OK:      false,
@@ -564,7 +591,7 @@ func (s *Server) doEvents(
         hash := sha256.Sum256(evt.Serialize())
         computedID := hex.EncodeToString(hash[:])
         if computedID != evt.ID {
-			println("doEvents: invalid event id for " + evt.ID + ", computed=" + computedID)
+			fmt.Printf("doEvents: invalid event id for %s, computed=%s%s\n", evt.ID, computedID, traceSuffix(ctx))
             ws.WriteJSON(nostr.OKEnvelope{
                 EventID: "",
                 OK:      false,
@@ -576,7 +603,7 @@ func (s *Server) doEvents(
         // 3.2 验签
         sigOK, err := evt.CheckSignature()
         if err != nil {
-			println("doEvents: failed to verify signature for " + evt.ID + ": " + err.Error())
+			fmt.Printf("doEvents: failed to verify signature for %s: %s%s\n", evt.ID, err.Error(), traceSuffix(ctx))
             ws.WriteJSON(nostr.OKEnvelope{
                 EventID: evt.ID,
                 OK:      false,
@@ -584,7 +611,7 @@ func (s *Server) doEvents(
             })
             return ""
         } else if !sigOK {
-			println("doEvents: invalid signature for " + evt.ID)
+			fmt.Printf("doEvents: invalid signature for %s%s\n", evt.ID, traceSuffix(ctx))
             ws.WriteJSON(nostr.OKEnvelope{
                 EventID: evt.ID,
                 OK:      false,
@@ -595,7 +622,7 @@ func (s *Server) doEvents(
 
         accept, why := s.relay.AcceptEvent(ctx, &evt)
         if !accept {
-			println("doEvents: event rejected by relay: " + why)
+			fmt.Printf("doEvents: event rejected by relay: %s%s\n", why, traceSuffix(ctx))
             ws.WriteJSON(nostr.OKEnvelope{
                 EventID: evt.ID,
                 OK:      false,
@@ -615,7 +642,7 @@ func (s *Server) doEvents(
 	if postgresBackend, ok := store.(*postgresql.PostgresBackend); ok {
 		tx, err := postgresBackend.DB.BeginTxx(ctx, nil)
 		if err != nil {
-			s.Log.Errorf("doEvents: failed to begin transaction: %v", err)
+			s.Log.Errorf("doEvents: failed to begin transaction: %v%s", err, traceSuffix(ctx))
 			ws.WriteJSON(nostr.OKEnvelope{
 				EventID: "",
 				OK:      false,
@@ -639,7 +666,7 @@ func (s *Server) doEvents(
 		// Save events in same transaction (first)
 		accepted, reason := AddEvents(ctxWithTx, s.relay, events)
 		if !accepted {
-			s.Log.Infof("doEvents: batch failed: %s", reason)
+			s.Log.Infof("doEvents: batch failed: %s%s", reason, traceSuffix(ctx))
 			ws.WriteJSON(nostr.OKEnvelope{
 				EventID: "",
 				OK:      false,
@@ -652,7 +679,7 @@ func (s *Server) doEvents(
 		if len(disappearingEvents) > 0 {
 			err = s.handleDisappearingMessageList(ctxWithTx, disappearingEvents)
 			if err != nil {
-				s.Log.Errorf("doEvents: failed to handle disappearing messages: %v", err)
+				s.Log.Errorf("doEvents: failed to handle disappearing messages: %v%s", err, traceSuffix(ctx))
 				ws.WriteJSON(nostr.OKEnvelope{
 					EventID: "",
 					OK:      false,
@@ -679,7 +706,7 @@ func (s *Server) doEvents(
 							}
 							continue
 						}
-						s.Log.Errorf("doEvents: failed to handle group management event %s: %v", evt.ID, err)
+						s.Log.Errorf("doEvents: failed to handle group management event %s: %v%s", evt.ID, err, traceSuffix(ctx))
 						ws.WriteJSON(nostr.OKEnvelope{
 							EventID: evt.ID,
 							OK:      false,
@@ -693,7 +720,7 @@ func (s *Server) doEvents(
 
 		// Commit before sending any OK so clients only get success after durability
 		if commitErr := tx.Commit(); commitErr != nil {
-			s.Log.Errorf("doEvents: failed to commit transaction: %v", commitErr)
+			s.Log.Errorf("doEvents: failed to commit transaction: %v%s", commitErr, traceSuffix(ctx))
 			discardPostCommitBroadcast(tx)
 			ws.WriteJSON(nostr.OKEnvelope{
 				EventID: "",
@@ -722,7 +749,7 @@ func (s *Server) doEvents(
 	if len(disappearingEvents) > 0 {
 		err := s.handleDisappearingMessageList(ctx, disappearingEvents)
 		if err != nil {
-			println("doEvents: failed to handle disappearing messages: " + err.Error())
+			fmt.Printf("doEvents: failed to handle disappearing messages: %s%s\n", err.Error(), traceSuffix(ctx))
 		}
 	}
 
@@ -757,7 +784,7 @@ func (s *Server) doEvents(
     }
 	
 	if !accepted {
-		s.Log.Infof("doEvents: batch failed: %s", reason)
+		s.Log.Infof("doEvents: batch failed: %s%s", reason, traceSuffix(ctx))
 		ws.WriteJSON(nostr.OKEnvelope{
 			EventID: "",
 			OK:      false,
@@ -798,7 +825,7 @@ func (s *Server) doCount(ctx context.Context, ws *WebSocket, request []json.RawM
 
 		count, err := counter.CountEvents(ctx, filter)
 		if err != nil {
-			s.Log.Errorf("store: %v", err)
+			s.Log.Errorf("store: %v%s", err, traceSuffix(ctx))
 			continue
 		}
 		total += count
@@ -873,8 +900,8 @@ func (s *Server) doReq(ctx context.Context, ws *WebSocket, request []json.RawMes
 
 	if closing || !alive {
 		atomic.AddInt64(&metricReqDroppedOnClosed, 1)
-		fmt.Printf("NOSTR_REQ_DROP ws=%p id=%s reason=%s\n", ws, id,
-			map[bool]string{true: "closing", false: "conn-not-in-clients"}[closing])
+		fmt.Printf("NOSTR_REQ_DROP ws=%p id=%s reason=%s%s\n", ws, id,
+			map[bool]string{true: "closing", false: "conn-not-in-clients"}[closing], traceSuffix(ctx))
 		return ""
 	}
 
@@ -925,9 +952,9 @@ func (s *Server) doReq(ctx context.Context, ws *WebSocket, request []json.RawMes
 
 			dbStart := time.Now()
 			if qctx == nil {
-				fmt.Printf("doReq: context is nil for filter %d\n", idx)
+				fmt.Printf("doReq: context is nil for filter %d%s\n", idx, traceSuffix(ctx))
 			} else if qctx.Err() != nil {
-				fmt.Printf("doReq: context error for filter %d: %v\n", idx, qctx.Err())
+				fmt.Printf("doReq: context error for filter %d: %v%s\n", idx, qctx.Err(), traceSuffix(ctx))
 			}
 
 			if (len(filter.Authors) == 0 && len(filter.Tags) == 0 && filter.Kinds == nil && filter.Since == nil && filter.Until == nil && filter.Search == "") && filter.Limit == 0 {
@@ -941,7 +968,7 @@ func (s *Server) doReq(ctx context.Context, ws *WebSocket, request []json.RawMes
 			events, err := store.QueryEvents(qctx, filter)
 			if err != nil && errors.Is(err, context.DeadlineExceeded) {
 				// 单 filter 超时：打断整次 REQ（不写 EOSE、不 setListener），让客户端自行重试
-				fmt.Printf("REQ filter timeout ws=%p id=%s idx=%d waited=%v db=%v\n", ws, id, idx, time.Since(acqStart), time.Since(dbStart))
+				fmt.Printf("REQ filter timeout ws=%p id=%s idx=%d waited=%v db=%v%s\n", ws, id, idx, time.Since(acqStart), time.Since(dbStart), traceSuffix(ctx))
 				cancel() // 取消整个 reqCtx，下面写环节会感知
 				// release the per-filter timeout context
 				qcancel()
@@ -985,7 +1012,7 @@ func (s *Server) doReq(ctx context.Context, ws *WebSocket, request []json.RawMes
 		}
 
 		if result.err != nil {
-			s.Log.Errorf("store: %v", result.err)
+			s.Log.Errorf("store: %v%s", result.err, traceSuffix(ctx))
 			results[idx].filterTime = time.Since(eventProcessStart)
 			if result.cancel != nil { result.cancel() }
 			continue
@@ -1020,7 +1047,7 @@ func (s *Server) doReq(ctx context.Context, ws *WebSocket, request []json.RawMes
 					listenersMutex.Lock()
 					if _, ok := closingWS[ws]; !ok {
 						closingWS[ws] = struct{}{}
-						fmt.Printf("NOSTR_WS_MARK_CLOSING ws=%p conn=%p reason=history_write_err:%v\n", ws, ws.conn, err)
+						fmt.Printf("NOSTR_WS_MARK_CLOSING ws=%p conn=%p reason=history_write_err:%v%s\n", ws, ws.conn, err, traceSuffix(ctx))
 					}
 					listenersMutex.Unlock()
 
@@ -1083,15 +1110,15 @@ func (s *Server) doReq(ctx context.Context, ws *WebSocket, request []json.RawMes
 	}
 
 	// 单行打印时间统计
-	s.Log.Infof("REQ %s timing: Total:%v Filters:%d [%s] TotalDB:%v TotalEvents:%d (parallel)", 
-		id, totalTime, len(filters), filterInfo, totalDbTime, totalEvents)
+	s.Log.Infof("REQ %s timing: Total:%v Filters:%d [%s] TotalDB:%v TotalEvents:%d (parallel)%s",
+		id, totalTime, len(filters), filterInfo, totalDbTime, totalEvents, traceSuffix(ctx))
 
 	if err := ws.WriteJSON(nostr.EOSEEnvelope(id)); err != nil {
 		// EOSE 写失败，直接标记并退出，绝不 setListener
 		listenersMutex.Lock()
 		if _, ok := closingWS[ws]; !ok {
 			closingWS[ws] = struct{}{}
-			fmt.Printf("NOSTR_WS_MARK_CLOSING ws=%p conn=%p reason=eose_write_err:%v\n", ws, ws.conn, err)
+			fmt.Printf("NOSTR_WS_MARK_CLOSING ws=%p conn=%p reason=eose_write_err:%v%s\n", ws, ws.conn, err, traceSuffix(ctx))
 		}
 		listenersMutex.Unlock()
 		return ""
@@ -1108,8 +1135,8 @@ func (s *Server) doReq(ctx context.Context, ws *WebSocket, request []json.RawMes
 
 	if closing || !alive {
 		atomic.AddInt64(&metricReqDroppedOnClosed, 1)
-		fmt.Printf("NOSTR_REQ_DROP ws=%p id=%s reason=%s\n", ws, id,
-			map[bool]string{true: "closing", false: "conn-not-in-clients"}[closing])
+		fmt.Printf("NOSTR_REQ_DROP ws=%p id=%s reason=%s%s\n", ws, id,
+			map[bool]string{true: "closing", false: "conn-not-in-clients"}[closing], traceSuffix(ctx))
 		return ""
 	}
 	setListener(id, ws, filters)
@@ -1178,6 +1205,7 @@ const (
 	httpMaxEvents            = 500000 // total events allowed in one HTTP response
 	httpMaxResponseSizeBytes = 50 * 1024 * 1024
 	httpMaxFiltersDefault    = 0 // 0 表示不限制 filter 数量
+	httpRequestTimeoutSecs   = 60
 )
 
 // HTTPQueryLimits is the public shape used to read/update HTTP query caps.
@@ -1186,6 +1214,7 @@ type HTTPQueryLimits struct {
 	MaxEvents          int `json:"max_events"`
 	MaxResponseBytes   int `json:"max_response_bytes"`
 	MaxFilters         int `json:"max_filters"` // 0 or negative means unlimited
+	RequestTimeoutSecs int `json:"request_timeout_secs"`
 }
 
 type httpQueryConfig struct {
@@ -1193,6 +1222,7 @@ type httpQueryConfig struct {
 	maxEvents          atomic.Int64
 	maxResponseBytes   atomic.Int64
 	maxFilters         atomic.Int64
+	requestTimeoutSecs atomic.Int64
 }
 
 func newHTTPQueryConfig() *httpQueryConfig {
@@ -1202,6 +1232,7 @@ func newHTTPQueryConfig() *httpQueryConfig {
 		MaxEvents:          httpMaxEvents,
 		MaxResponseBytes:   httpMaxResponseSizeBytes,
 		MaxFilters:         httpMaxFiltersDefault,
+		RequestTimeoutSecs: httpRequestTimeoutSecs,
 	})
 	return cfg
 }
@@ -1220,6 +1251,9 @@ func (c *httpQueryConfig) set(limits HTTPQueryLimits) {
 	if limits.MaxFilters >= 0 {
 		c.maxFilters.Store(int64(limits.MaxFilters))
 	}
+	if limits.RequestTimeoutSecs > 0 {
+		c.requestTimeoutSecs.Store(int64(limits.RequestTimeoutSecs))
+	}
 }
 
 func (c *httpQueryConfig) snapshot() HTTPQueryLimits {
@@ -1228,6 +1262,7 @@ func (c *httpQueryConfig) snapshot() HTTPQueryLimits {
 		MaxEvents:          int(c.maxEvents.Load()),
 		MaxResponseBytes:   int(c.maxResponseBytes.Load()),
 		MaxFilters:         int(c.maxFilters.Load()),
+		RequestTimeoutSecs: int(c.requestTimeoutSecs.Load()),
 	}
 }
 
@@ -1247,6 +1282,7 @@ func (s *Server) HTTPQueryLimits() HTTPQueryLimits {
 			MaxEvents:          httpMaxEvents,
 			MaxResponseBytes:   httpMaxResponseSizeBytes,
 			MaxFilters:         httpMaxFiltersDefault,
+			RequestTimeoutSecs: httpRequestTimeoutSecs,
 		}
 	}
 	return s.httpQueryConfig.snapshot()
@@ -1288,11 +1324,21 @@ func (s *Server) HandleHttpReq(w http.ResponseWriter, req *http.Request, store e
 	if limits.MaxFilters < 0 {
 		limits.MaxFilters = httpMaxFiltersDefault
 	}
+	if limits.RequestTimeoutSecs <= 0 {
+		limits.RequestTimeoutSecs = httpRequestTimeoutSecs
+	}
+
+	// 设置请求超时
+	ctx, cancel := context.WithTimeout(req.Context(), time.Duration(limits.RequestTimeoutSecs)*time.Second)
+	defer cancel()
+	if traceID := strings.TrimSpace(req.Header.Get(traceIDHeader)); traceID != "" {
+		ctx = context.WithValue(ctx, traceIDContextKey, traceID)
+	}
 
 	// 尝试从请求头中获取用户 pubkey 并添加到 context
 	if userPubkey := req.Header.Get("pubkey"); userPubkey != "" {
 		ctx = context.WithValue(ctx, "userPubkey", userPubkey)
-		s.Log.Infof("HTTP request with user pubkey: %s", userPubkey)
+		s.Log.Infof("HTTP request with user pubkey: %s%s", userPubkey, traceSuffix(ctx))
 	}
 
 	// 统一的错误响应函数
@@ -1308,11 +1354,11 @@ func (s *Server) HandleHttpReq(w http.ResponseWriter, req *http.Request, store e
 		w.WriteHeader(httpStatus)
 
 		if err := json.NewEncoder(w).Encode(response); err != nil {
-			s.Log.Errorf("failed to encode error response: %v", err)
+			s.Log.Errorf("failed to encode error response: %v%s", err, traceSuffix(ctx))
 			// 最后的兜底，直接写入简单的错误 JSON
 			w.Write([]byte(`{"code":-1,"msg":"internal error: failed to serialize error response","data":[]}`))
 		}
-		s.Log.Errorf("HTTP request failed: %s", errorMsg)
+		s.Log.Errorf("HTTP request failed: %s%s", errorMsg, traceSuffix(ctx))
 	}
 
 	if store == nil {
@@ -1366,7 +1412,7 @@ filterLoop:
         // 检查上下文是否已取消
         select {
         case <-ctx.Done():
-            s.Log.Warningf("request timeout at filter %d", idx)
+			s.Log.Warningf("request timeout at filter %d%s", idx, traceSuffix(ctx))
             break filterLoop
         default:
         }
@@ -1383,7 +1429,7 @@ filterLoop:
         
         events, err := store.QueryEvents(ctx, filter)
         if err != nil {
-            s.Log.Errorf("query error for filter %d: %v", idx, err)
+			s.Log.Errorf("query error for filter %d: %v%s", idx, err, traceSuffix(ctx))
             continue
         }
 
@@ -1393,7 +1439,7 @@ filterLoop:
             // 检查上下文
             select {
             case <-ctx.Done():
-                s.Log.Warningf("request timeout while processing events")
+				s.Log.Warningf("request timeout while processing events%s", traceSuffix(ctx))
                 // 耗尽剩余的 channel
                 for range events {
                 }
@@ -1416,7 +1462,7 @@ filterLoop:
             
             // 检查总数限制
 			if totalEventCount >= limits.MaxEvents {
-				s.Log.Infof("reached max events limit (%d), stopping", limits.MaxEvents)
+				s.Log.Infof("reached max events limit (%d), stopping%s", limits.MaxEvents, traceSuffix(ctx))
                 // 耗尽剩余的 channel
                 for range events {
                 }
@@ -1458,14 +1504,14 @@ filterLoop:
     
     responseBytes, err := json.Marshal(response)
     if err != nil {
-        s.Log.Errorf("failed to marshal response: %v", err)
+		s.Log.Errorf("failed to marshal response: %v%s", err, traceSuffix(ctx))
         sendErrorResponse("failed to serialize response: "+err.Error(), http.StatusInternalServerError)
         return
     }
     
 	// 检查响应大小，如果太大则分批返回（对未压缩数据限额）
 	if len(responseBytes) > limits.MaxResponseBytes {
-        s.Log.Warningf("response too large: %d bytes, truncating to first events", len(responseBytes))
+		s.Log.Warningf("response too large: %d bytes, truncating to first events%s", len(responseBytes), traceSuffix(ctx))
         
         // 如果响应太大，逐步减少事件数量直到响应大小合适
         maxEvents := len(allEvents) / 2
@@ -1477,7 +1523,7 @@ filterLoop:
             }
             responseBytes, err = json.Marshal(truncatedResponse)
             if err != nil {
-                s.Log.Errorf("failed to marshal truncated response: %v", err)
+				s.Log.Errorf("failed to marshal truncated response: %v%s", err, traceSuffix(ctx))
                 sendErrorResponse("failed to serialize truncated response: "+err.Error(), http.StatusInternalServerError)
                 return
             }
@@ -1485,7 +1531,7 @@ filterLoop:
         }
         
 		if len(responseBytes) > limits.MaxResponseBytes {
-            s.Log.Errorf("unable to reduce response size below limit")
+			s.Log.Errorf("unable to reduce response size below limit%s", traceSuffix(ctx))
             sendErrorResponse("response too large, unable to reduce size", http.StatusRequestEntityTooLarge)
             return
         }
@@ -1499,12 +1545,12 @@ filterLoop:
 		var buf bytes.Buffer
 		gz := gzip.NewWriter(&buf)
 		if _, err := gz.Write(responseBytes); err != nil {
-			s.Log.Errorf("failed to gzip response: %v", err)
+			s.Log.Errorf("failed to gzip response: %v%s", err, traceSuffix(ctx))
 			sendErrorResponse("failed to compress response: "+err.Error(), http.StatusInternalServerError)
 			return
 		}
 		if err := gz.Close(); err != nil {
-			s.Log.Errorf("failed to finalize gzip response: %v", err)
+			s.Log.Errorf("failed to finalize gzip response: %v%s", err, traceSuffix(ctx))
 			sendErrorResponse("failed to finalize compressed response: "+err.Error(), http.StatusInternalServerError)
 			return
 		}
@@ -1512,7 +1558,7 @@ filterLoop:
 		w.Header().Set("Content-Encoding", "gzip")
 	}
 
-	s.Log.Infof("sending response: %d events, %d bytes (raw %d)", len(allEvents), len(body), originalSize)
+	s.Log.Infof("sending response: %d events, %d bytes (raw %d)%s", len(allEvents), len(body), originalSize, traceSuffix(ctx))
     
     // 设置 Content-Length 头部
 	w.Header().Set("Content-Length", fmt.Sprintf("%d", len(body)))
@@ -1530,7 +1576,7 @@ filterLoop:
         // 检查连接是否还活着
         select {
         case <-ctx.Done():
-            s.Log.Warningf("client disconnected during response writing at %d/%d bytes", totalWritten, len(responseBytes))
+			s.Log.Warningf("client disconnected during response writing at %d/%d bytes%s", totalWritten, len(body), traceSuffix(ctx))
             return
         default:
         }
@@ -1544,7 +1590,7 @@ filterLoop:
 
 		written, err := w.Write(body[totalWritten:end])
         if err != nil {
-            s.Log.Errorf("failed to write response chunk at offset %d (chunk size %d): %v", totalWritten, chunkSize, err)
+			s.Log.Errorf("failed to write response chunk at offset %d (chunk size %d): %v%s", totalWritten, chunkSize, err, traceSuffix(ctx))
             // 写入失败时，我们已经开始发送响应了，无法再发送错误响应
             // 只能记录错误并返回，客户端会收到不完整的响应
             return
@@ -1563,7 +1609,7 @@ filterLoop:
         }
     }
     
-    s.Log.Infof("HTTP query completed successfully: %d events, %d bytes written", len(allEvents), totalWritten)
+	s.Log.Infof("HTTP query completed successfully: %d events, %d bytes written%s", len(allEvents), totalWritten, traceSuffix(ctx))
 }
 func (s *Server) handleMessage(ctx context.Context, ws *WebSocket, message []byte, defaultStore eventstore.Store) {
 	var notice string
@@ -1613,7 +1659,7 @@ func (s *Server) handleMessage(ctx context.Context, ws *WebSocket, message []byt
 	case "REQ":
 		notice = s.doReq(ctx, ws, request, store)
 	case "CLOSE":
-		fmt.Printf("CLOSE %s from [%s]\n", string(message), GetConnPubkey(ctx, ws))
+		fmt.Printf("CLOSE %s from [%s]%s\n", string(message), GetConnPubkey(ctx, ws), traceSuffix(ctx))
 		notice = s.doClose(ctx, ws, request, store)
 	case "AUTH":
 		notice = s.doAuth(ctx, ws, request, store)
@@ -1628,10 +1674,13 @@ func (s *Server) handleMessage(ctx context.Context, ws *WebSocket, message []byt
 
 func (s *Server) HandleWebsocket(w http.ResponseWriter, r *http.Request) {
 	atomic.AddInt64(&activeWebSocketConnections, 1)
-	
+
+	traceID := strings.TrimSpace(r.Header.Get(traceIDHeader))
+	traceLogSuffix := traceSuffixFromID(traceID)
+
 	conn, err := upgrader.Upgrade(w, r, nil)
 	if err != nil {
-		s.Log.Errorf("failed to upgrade websocket: %v", err)
+		s.Log.Errorf("failed to upgrade websocket: %v%s", err, traceLogSuffix)
 		return
 	}
 	
@@ -1639,7 +1688,7 @@ func (s *Server) HandleWebsocket(w http.ResponseWriter, r *http.Request) {
 	s.clients[conn] = struct{}{}
 	clientCount := len(s.clients)
 	s.clientsMu.Unlock()
-	s.Log.Infof("length of websocket clients: %d", clientCount)
+	s.Log.Infof("length of websocket clients: %d%s", clientCount, traceLogSuffix)
 	ticker := time.NewTicker(pingPeriod)
 
 	ip := conn.RemoteAddr().String()
@@ -1648,10 +1697,10 @@ func (s *Server) HandleWebsocket(w http.ResponseWriter, r *http.Request) {
 	} else if realIP := r.Header.Get("X-Real-Ip"); realIP != "" {
 		ip = realIP
 	}
-	s.Log.Infof("connected from %s", ip)
+	s.Log.Infof("connected from %s%s", ip, traceLogSuffix)
 
 	ws := challenge(conn)
-	fmt.Printf("NOSTR_WS_OPEN ws=%p conn=%p, ip=%s\n", ws, conn, ip)
+	fmt.Printf("NOSTR_WS_OPEN ws=%p conn=%p, ip=%s%s\n", ws, conn, ip, traceLogSuffix)
 
 	if s.options.perConnectionLimiter != nil {
 		ws.limiter = rate.NewLimiter(
@@ -1662,11 +1711,14 @@ func (s *Server) HandleWebsocket(w http.ResponseWriter, r *http.Request) {
 
 	// 创建基础 context
 	ctx, cancel := context.WithCancel(context.Background())
-	
+	if traceID != "" {
+		ctx = context.WithValue(ctx, traceIDContextKey, traceID)
+	}
+
 	// 尝试从请求头中获取用户 pubkey 并添加到 context
 	if userPubkey := r.Header.Get("pubkey"); userPubkey != "" {
 		ctx = context.WithValue(ctx, "userPubkey", userPubkey)
-		s.Log.Infof("WebSocket connection with user pubkey: %s", userPubkey)
+		s.Log.Infof("WebSocket connection with user pubkey: %s%s", userPubkey, traceSuffix(ctx))
 	}
 
 	store := s.relay.Storage(ctx)
@@ -1692,9 +1744,9 @@ func (s *Server) HandleWebsocket(w http.ResponseWriter, r *http.Request) {
 			s.clientsMu.Unlock()
 			removed := removeListener(ws, reasonDisconnect)
 			if removed > 0 {
-				s.Log.Infof("ws=%p removed_subs=%d (reader)", ws, removed)
+				s.Log.Infof("ws=%p removed_subs=%d (reader)%s", ws, removed, traceSuffix(ctx))
 			}
-			s.Log.Infof("disconnected from %s from [%s]", ip, GetConnPubkey(ctx, ws))
+			s.Log.Infof("disconnected from %s from [%s]%s", ip, GetConnPubkey(ctx, ws), traceSuffix(ctx))
 		}()
 
 		conn.SetReadLimit(maxMessageSize)
@@ -1710,7 +1762,7 @@ func (s *Server) HandleWebsocket(w http.ResponseWriter, r *http.Request) {
 				listenersMutex.Lock()
 				if _, ok := closingWS[ws]; !ok {
 					closingWS[ws] = struct{}{}
-					fmt.Printf("NOSTR_WS_MARK_CLOSING ws=%p conn=%p reason=read_err:%v\n", ws, conn, err)
+					fmt.Printf("NOSTR_WS_MARK_CLOSING ws=%p conn=%p reason=read_err:%v%s\n", ws, conn, err, traceSuffix(ctx))
 				}
 				listenersMutex.Unlock()
 				if websocket.IsUnexpectedCloseError(
@@ -1719,7 +1771,7 @@ func (s *Server) HandleWebsocket(w http.ResponseWriter, r *http.Request) {
 					websocket.CloseNoStatusReceived, // 1005
 					websocket.CloseAbnormalClosure,  // 1006
 				) {
-					s.Log.Warningf("unexpected close error from %s: %v", r.Header.Get("X-Forwarded-For"), err)
+					s.Log.Warningf("unexpected close error from %s: %v%s", r.Header.Get("X-Forwarded-For"), err, traceSuffix(ctx))
 				}
 				break
 			}
@@ -1728,7 +1780,7 @@ func (s *Server) HandleWebsocket(w http.ResponseWriter, r *http.Request) {
 				// NOTE: Wait will throttle the requests.
 				// To reject requests exceeding the limit, use if !ws.limiter.Allow()
 				if err := ws.limiter.Wait(context.TODO()); err != nil {
-					s.Log.Warningf("unexpected limiter error %v", err)
+					s.Log.Warningf("unexpected limiter error %v%s", err, traceSuffix(ctx))
 					continue
 				}
 			}
@@ -1759,7 +1811,7 @@ func (s *Server) HandleWebsocket(w http.ResponseWriter, r *http.Request) {
 			conn.Close()
 			removed := removeListener(ws, reasonDisconnect)
 			if removed > 0 {
-				s.Log.Infof("ws=%p removed_subs=%d (writer)", ws, removed)
+				s.Log.Infof("ws=%p removed_subs=%d (writer)%s", ws, removed, traceSuffix(ctx))
 			}
 		}()
 
@@ -1771,13 +1823,13 @@ func (s *Server) HandleWebsocket(w http.ResponseWriter, r *http.Request) {
 					listenersMutex.Lock()
 					if _, ok := closingWS[ws]; !ok {
 						closingWS[ws] = struct{}{}
-						fmt.Printf("NOSTR_WS_MARK_CLOSING ws=%p conn=%p reason=ping_write_err:%v\n", ws, conn, err)
+						fmt.Printf("NOSTR_WS_MARK_CLOSING ws=%p conn=%p reason=ping_write_err:%v%s\n", ws, conn, err, traceSuffix(ctx))
 					}
 					listenersMutex.Unlock()
-					s.Log.Errorf("error writing ping: %v; closing websocket", err)
+					s.Log.Errorf("error writing ping: %v; closing websocket%s", err, traceSuffix(ctx))
 					return
 				}
-				s.Log.Infof("pinging for %s", ip)
+				s.Log.Infof("pinging for %s%s", ip, traceSuffix(ctx))
 			case <-ctx.Done():
 				return
 			}
