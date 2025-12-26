@@ -30,8 +30,11 @@ import (
 	"golang.org/x/time/rate"
 )
 
-const traceIDContextKey = "amzn-trace-id"
-const traceIDHeader = "X-Amzn-Trace-Id"
+const traceIDContextKey = "trace-id"
+const rootTraceIDContextKey = "root-trace-id"
+const traceIDHeader = "Trace-Id"
+const rootTraceIDHeader = "Root-Trace-Id"
+const legacyTraceIDHeader = "X-Amzn-Trace-Id"
 
 // 简化的关键资源监控计数器 - 专注于活跃资源和性能瓶颈
 var (
@@ -74,15 +77,74 @@ func traceIDFromContext(ctx context.Context) string {
 	return ""
 }
 
-func traceSuffixFromID(traceID string) string {
-	if traceID == "" {
+func rootTraceIDFromContext(ctx context.Context) string {
+	if ctx == nil {
 		return ""
 	}
-	return " trace_id=" + traceID
+	if v := ctx.Value(rootTraceIDContextKey); v != nil {
+		if s, ok := v.(string); ok {
+			return s
+		}
+	}
+	return ""
+}
+
+func parseLegacyAmznTraceID(value string) (selfTraceID string, rootTraceID string) {
+	for _, part := range strings.Split(value, ";") {
+		part = strings.TrimSpace(part)
+		if strings.HasPrefix(part, "Root=") {
+			rootTraceID = strings.TrimPrefix(part, "Root=")
+		} else if strings.HasPrefix(part, "Self=") {
+			selfTraceID = strings.TrimPrefix(part, "Self=")
+		}
+	}
+	return selfTraceID, rootTraceID
+}
+
+func traceIDsFromHeaders(h http.Header) (traceID string, rootTraceID string) {
+	if h == nil {
+		return "", ""
+	}
+	if v := strings.TrimSpace(h.Get(traceIDHeader)); v != "" {
+		traceID = v
+	}
+	if v := strings.TrimSpace(h.Get(rootTraceIDHeader)); v != "" {
+		rootTraceID = v
+	}
+	if traceID != "" && rootTraceID != "" {
+		return traceID, rootTraceID
+	}
+
+	for _, v := range h.Values(legacyTraceIDHeader) {
+		selfID, rootID := parseLegacyAmznTraceID(v)
+		if traceID == "" && selfID != "" {
+			traceID = selfID
+		}
+		if rootTraceID == "" && rootID != "" {
+			rootTraceID = rootID
+		}
+		if traceID != "" && rootTraceID != "" {
+			break
+		}
+	}
+	return traceID, rootTraceID
+}
+
+func traceSuffixFromIDs(traceID string, rootTraceID string) string {
+	if traceID == "" && rootTraceID == "" {
+		return ""
+	}
+	if traceID == "" {
+		return " root_trace_id=" + rootTraceID
+	}
+	if rootTraceID == "" {
+		return " trace_id=" + traceID
+	}
+	return " trace_id=" + traceID + " root_trace_id=" + rootTraceID
 }
 
 func traceSuffix(ctx context.Context) string {
-	return traceSuffixFromID(traceIDFromContext(ctx))
+	return traceSuffixFromIDs(traceIDFromContext(ctx), rootTraceIDFromContext(ctx))
 }
 
 // StartResourceMonitoring 启动简化的资源监控goroutine（导出函数供外部调用）
@@ -1342,8 +1404,9 @@ func (s *Server) HandleHttpReq(w http.ResponseWriter, req *http.Request, store e
 	// 设置请求超时
 	ctx, cancel := context.WithTimeout(req.Context(), time.Duration(limits.RequestTimeoutSecs)*time.Second)
 	defer cancel()
-	if traceID := strings.TrimSpace(req.Header.Get(traceIDHeader)); traceID != "" {
+	if traceID, rootTraceID := traceIDsFromHeaders(req.Header); traceID != "" || rootTraceID != "" {
 		ctx = context.WithValue(ctx, traceIDContextKey, traceID)
+		ctx = context.WithValue(ctx, rootTraceIDContextKey, rootTraceID)
 	}
 
 	// 尝试从请求头中获取用户 pubkey 并添加到 context
@@ -1686,8 +1749,8 @@ func (s *Server) handleMessage(ctx context.Context, ws *WebSocket, message []byt
 func (s *Server) HandleWebsocket(w http.ResponseWriter, r *http.Request) {
 	atomic.AddInt64(&activeWebSocketConnections, 1)
 
-	traceID := strings.TrimSpace(r.Header.Get(traceIDHeader))
-	traceLogSuffix := traceSuffixFromID(traceID)
+	traceID, rootTraceID := traceIDsFromHeaders(r.Header)
+	traceLogSuffix := traceSuffixFromIDs(traceID, rootTraceID)
 
 	conn, err := upgrader.Upgrade(w, r, nil)
 	if err != nil {
@@ -1722,8 +1785,9 @@ func (s *Server) HandleWebsocket(w http.ResponseWriter, r *http.Request) {
 
 	// 创建基础 context
 	ctx, cancel := context.WithCancel(context.Background())
-	if traceID != "" {
+	if traceID != "" || rootTraceID != "" {
 		ctx = context.WithValue(ctx, traceIDContextKey, traceID)
+		ctx = context.WithValue(ctx, rootTraceIDContextKey, rootTraceID)
 	}
 
 	// 尝试从请求头中获取用户 pubkey 并添加到 context
