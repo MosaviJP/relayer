@@ -1408,6 +1408,8 @@ func (s *Server) HandleHttpReq(w http.ResponseWriter, req *http.Request, store e
 		ctx = context.WithValue(ctx, traceIDContextKey, traceID)
 		ctx = context.WithValue(ctx, rootTraceIDContextKey, rootTraceID)
 	}
+	queryCtx, cancelQueries := context.WithCancel(ctx)
+	defer cancelQueries()
 
 	// 尝试从请求头中获取用户 pubkey 并添加到 context
 	if userPubkey := req.Header.Get("pubkey"); userPubkey != "" {
@@ -1478,98 +1480,130 @@ func (s *Server) HandleHttpReq(w http.ResponseWriter, req *http.Request, store e
 
 	// 收集所有事件到内存中（非流式）
 	var allEvents []*nostr.Event = make([]*nostr.Event, 0) // 确保初始化为空切片而不是 nil
-	totalEventCount := 0
+	filterResults := make([][]*nostr.Event, len(filters))
+	filterElapsed := make([]time.Duration, len(filters))
+	filterDbElapsed := make([]time.Duration, len(filters))
+	filterEventCounts := make([]int, len(filters))
+	var totalEventCount int64
+	requestStart := time.Now()
 
-	// 处理每个 filter（参考 doReq 的逻辑）
-filterLoop:
+	var wg sync.WaitGroup
 	for idx, filter := range filters {
-		filterStart := time.Now()
-		// 检查上下文是否已取消
-		select {
-		case <-ctx.Done():
-			s.Log.Warningf("request timeout at filter %d%s", idx, traceSuffix(ctx))
-			break filterLoop
-		default:
-		}
-
-		// 如果 limit 为 0，跳过此 filter（参考 doReq）
+		idx := idx
+		filter := filter
 		if limitZeroFlags[idx] {
-			s.Log.Infof("HTTP filter %d skipped (limit=0)%s", idx, traceSuffix(ctx))
+			s.Log.Infof("HTTP filter %d skipped (limit=0)%s", idx, traceSuffix(queryCtx))
 			continue
 		}
-
-		// 应用与 doReq 相同的 limit 逻辑
 		if filter.Limit == 0 {
 			filter.Limit = limits.DefaultFilterLimit
 		}
 
-		events, err := store.QueryEvents(ctx, filter)
-		if err != nil {
-			s.Log.Errorf("query error for filter %d: %v%s", idx, err, traceSuffix(ctx))
-			continue
-		}
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			filterStart := time.Now()
 
-		var filterEvents []*nostr.Event
-		filterEventCount := 0
-		for ev := range events {
-			// 检查上下文
 			select {
-			case <-ctx.Done():
-				s.Log.Warningf("request timeout while processing events%s", traceSuffix(ctx))
-				// 耗尽剩余的 channel
-				for range events {
-				}
-				break filterLoop
+			case <-queryCtx.Done():
+				s.Log.Warningf("request timeout at filter %d%s", idx, traceSuffix(queryCtx))
+				return
 			default:
 			}
 
-			// skipEventFunc已在数据库层面处理，无需再次过滤
-			// if s.options.skipEventFunc != nil && s.options.skipEventFunc(ev) {
-			//     continue
-			// }
+			dbStart := time.Now()
+			events, err := store.QueryEvents(queryCtx, filter)
+			dbDuration := time.Since(dbStart)
+			if err != nil {
+				s.Log.Errorf("query error for filter %d: %v%s", idx, err, traceSuffix(queryCtx))
+				filterDbElapsed[idx] = dbDuration
+				return
+			}
 
-			// 检查单个 filter 的 limit
-			if filterEventCount >= filter.Limit {
-				// 耗尽剩余的 channel
-				for range events {
+			var filterEvents []*nostr.Event
+			filterEventCount := 0
+			for ev := range events {
+				select {
+				case <-queryCtx.Done():
+					s.Log.Warningf("request timeout while processing events%s", traceSuffix(queryCtx))
+					for range events {
+					}
+					return
+				default:
 				}
+
+				if filterEventCount >= filter.Limit {
+					for range events {
+					}
+					break
+				}
+
+				if atomic.LoadInt64(&totalEventCount) >= int64(limits.MaxEvents) {
+					s.Log.Infof("reached max events limit (%d), stopping%s", limits.MaxEvents, traceSuffix(queryCtx))
+					cancelQueries()
+					for range events {
+					}
+					break
+				}
+
+				newTotal := atomic.AddInt64(&totalEventCount, 1)
+				if newTotal > int64(limits.MaxEvents) {
+					atomic.AddInt64(&totalEventCount, -1)
+					cancelQueries()
+					for range events {
+					}
+					break
+				}
+
+				filterEvents = append(filterEvents, ev)
+				filterEventCount++
+			}
+
+			for range events {
+			}
+
+			filterResults[idx] = filterEvents
+			filterDbElapsed[idx] = dbDuration
+			filterEventCounts[idx] = filterEventCount
+			filterElapsed[idx] = time.Since(filterStart)
+		}()
+	}
+
+	wg.Wait()
+
+	for _, events := range filterResults {
+		for _, ev := range events {
+			if len(allEvents) >= limits.MaxEvents {
 				break
 			}
-
-			// 检查总数限制
-			if totalEventCount >= limits.MaxEvents {
-				s.Log.Infof("reached max events limit (%d), stopping%s", limits.MaxEvents, traceSuffix(ctx))
-				// 耗尽剩余的 channel
-				for range events {
-				}
-				break filterLoop
-			}
-
-			filterEvents = append(filterEvents, ev)
-			filterEventCount++
-			totalEventCount++
+			allEvents = append(allEvents, ev)
 		}
-
-		// 耗尽 channel 确保清理
-		for range events {
-		}
-
-		allEvents = append(allEvents, filterEvents...)
-
-		s.Log.Infof(
-			"HTTP filter %d done: events=%d limit=%d elapsed=%s%s",
-			idx,
-			filterEventCount,
-			filter.Limit,
-			time.Since(filterStart),
-			traceSuffix(ctx),
-		)
-
-		// 检查是否应该停止
-		if totalEventCount >= limits.MaxEvents {
-			break filterLoop
+		if len(allEvents) >= limits.MaxEvents {
+			break
 		}
 	}
+
+	filterInfo := ""
+	totalDbTime := time.Duration(0)
+	for i, elapsed := range filterElapsed {
+		if elapsed == 0 && filterDbElapsed[i] == 0 {
+			continue
+		}
+		if filterInfo != "" {
+			filterInfo += ","
+		}
+		filterInfo += fmt.Sprintf("F%d:%v(db:%v,events:%d)", i, elapsed, filterDbElapsed[i], filterEventCounts[i])
+		totalDbTime += filterDbElapsed[i]
+	}
+	s.Log.Infof(
+		"HTTP REQ timing: Total:%v Filters:%d [%s] TotalDB:%v TotalEvents:%d (parallel)%s",
+		time.Since(requestStart),
+		len(filters),
+		filterInfo,
+		totalDbTime,
+		len(allEvents),
+		traceSuffix(queryCtx),
+	)
 
 	// 设置适当的头部
 	w.Header().Set("Content-Type", "application/json; charset=utf-8")
