@@ -1408,15 +1408,16 @@ func (s *Server) HandleHttpReq(w http.ResponseWriter, req *http.Request, store e
 		ctx = context.WithValue(ctx, traceIDContextKey, traceID)
 		ctx = context.WithValue(ctx, rootTraceIDContextKey, rootTraceID)
 	}
-	queryCtx, cancelQueries := context.WithCancel(ctx)
-	defer cancelQueries()
-
+	
 	// 尝试从请求头中获取用户 pubkey 并添加到 context
 	if userPubkey := req.Header.Get("pubkey"); userPubkey != "" {
 		ctx = context.WithValue(ctx, "userPubkey", userPubkey)
 		s.Log.Infof("HTTP request with user pubkey: %s%s", userPubkey, traceSuffix(ctx))
 	}
-
+	
+	queryCtx, cancelQueries := context.WithCancel(ctx)
+	defer cancelQueries()
+	
 	// 统一的错误响应函数
 	sendErrorResponse := func(errorMsg string, httpStatus int) {
 		response := QueryResponse{
