@@ -1483,6 +1483,7 @@ func (s *Server) HandleHttpReq(w http.ResponseWriter, req *http.Request, store e
 	// 处理每个 filter（参考 doReq 的逻辑）
 filterLoop:
 	for idx, filter := range filters {
+		filterStart := time.Now()
 		// 检查上下文是否已取消
 		select {
 		case <-ctx.Done():
@@ -1493,6 +1494,7 @@ filterLoop:
 
 		// 如果 limit 为 0，跳过此 filter（参考 doReq）
 		if limitZeroFlags[idx] {
+			s.Log.Infof("HTTP filter %d skipped (limit=0)%s", idx, traceSuffix(ctx))
 			continue
 		}
 
@@ -1553,6 +1555,15 @@ filterLoop:
 		}
 
 		allEvents = append(allEvents, filterEvents...)
+
+		s.Log.Infof(
+			"HTTP filter %d done: events=%d limit=%d elapsed=%s%s",
+			idx,
+			filterEventCount,
+			filter.Limit,
+			time.Since(filterStart),
+			traceSuffix(ctx),
+		)
 
 		// 检查是否应该停止
 		if totalEventCount >= limits.MaxEvents {
