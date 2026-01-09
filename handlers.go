@@ -1372,7 +1372,7 @@ func (s *Server) HandleHTTPQueryConfig(w http.ResponseWriter, req *http.Request)
 	case http.MethodPost:
 		var incoming HTTPQueryLimits
 		if err := json.NewDecoder(req.Body).Decode(&incoming); err != nil {
-			http.Error(w, "invalid JSON body: "+err.Error(), http.StatusBadRequest)
+			http.Error(w, "invalid JSON body: "+err.Error(), http.StatusOK)
 			return
 		}
 		s.SetHTTPQueryLimits(incoming)
@@ -1439,7 +1439,7 @@ func (s *Server) HandleHttpReq(w http.ResponseWriter, req *http.Request, store e
 	}
 
 	if store == nil {
-		sendErrorResponse("no store available", http.StatusInternalServerError)
+		sendErrorResponse("no store available", http.StatusOK)
 		return
 	}
 
@@ -1447,7 +1447,7 @@ func (s *Server) HandleHttpReq(w http.ResponseWriter, req *http.Request, store e
 		Filters []json.RawMessage `json:"filters"`
 	}
 	if err := json.NewDecoder(req.Body).Decode(&reqBody); err != nil {
-		sendErrorResponse("invalid request body: "+err.Error(), http.StatusBadRequest)
+		sendErrorResponse("invalid request body: "+err.Error(), http.StatusOK)
 		return
 	}
 
@@ -1456,14 +1456,14 @@ func (s *Server) HandleHttpReq(w http.ResponseWriter, req *http.Request, store e
 	limitZeroFlags := make([]bool, len(filters))
 
 	if limits.MaxFilters > 0 && len(reqBody.Filters) > limits.MaxFilters {
-		sendErrorResponse(fmt.Sprintf("too many filters: %d > %d", len(reqBody.Filters), limits.MaxFilters), http.StatusRequestEntityTooLarge)
+		sendErrorResponse(fmt.Sprintf("too many filters: %d > %d", len(reqBody.Filters), limits.MaxFilters), http.StatusOK)
 		return
 	}
 
 	for i, filterReq := range reqBody.Filters {
 		var raw map[string]json.RawMessage
 		if err := json.Unmarshal(filterReq, &raw); err != nil {
-			sendErrorResponse("failed to decode filter: "+err.Error(), http.StatusBadRequest)
+			sendErrorResponse("failed to decode filter: "+err.Error(), http.StatusOK)
 			return
 		}
 		if v, ok := raw["limit"]; ok {
@@ -1474,7 +1474,7 @@ func (s *Server) HandleHttpReq(w http.ResponseWriter, req *http.Request, store e
 		}
 
 		if err := json.Unmarshal(filterReq, &filters[i]); err != nil {
-			sendErrorResponse("failed to decode filter: "+err.Error(), http.StatusBadRequest)
+			sendErrorResponse("failed to decode filter: "+err.Error(), http.StatusOK)
 			return
 		}
 	}
@@ -1575,12 +1575,12 @@ func (s *Server) HandleHttpReq(w http.ResponseWriter, req *http.Request, store e
 	wg.Wait()
 
 	if ctx.Err() != nil {
-		sendErrorResponse("request timeout", http.StatusRequestTimeout)
+		sendErrorResponse("request timeout", http.StatusOK)
 		return
 	}
 	for idx, err := range filterErrors {
 		if err != nil {
-			sendErrorResponse(fmt.Sprintf("query error for filter %d: %v", idx, err), http.StatusInternalServerError)
+			sendErrorResponse(fmt.Sprintf("query error for filter %d: %v", idx, err), http.StatusOK)
 			return
 		}
 	}
@@ -1638,7 +1638,7 @@ func (s *Server) HandleHttpReq(w http.ResponseWriter, req *http.Request, store e
 	responseBytes, err := json.Marshal(response)
 	if err != nil {
 		s.Log.Errorf("failed to marshal response: %v%s", err, traceSuffix(ctx))
-		sendErrorResponse("failed to serialize response: "+err.Error(), http.StatusInternalServerError)
+		sendErrorResponse("failed to serialize response: "+err.Error(), http.StatusOK)
 		return
 	}
 
@@ -1657,7 +1657,7 @@ func (s *Server) HandleHttpReq(w http.ResponseWriter, req *http.Request, store e
 			responseBytes, err = json.Marshal(truncatedResponse)
 			if err != nil {
 				s.Log.Errorf("failed to marshal truncated response: %v%s", err, traceSuffix(ctx))
-				sendErrorResponse("failed to serialize truncated response: "+err.Error(), http.StatusInternalServerError)
+				sendErrorResponse("failed to serialize truncated response: "+err.Error(), http.StatusOK)
 				return
 			}
 			maxEvents = maxEvents / 2
@@ -1665,7 +1665,7 @@ func (s *Server) HandleHttpReq(w http.ResponseWriter, req *http.Request, store e
 
 		if len(responseBytes) > limits.MaxResponseBytes {
 			s.Log.Errorf("unable to reduce response size below limit%s", traceSuffix(ctx))
-			sendErrorResponse("response too large, unable to reduce size", http.StatusRequestEntityTooLarge)
+			sendErrorResponse("response too large, unable to reduce size", http.StatusOK)
 			return
 		}
 	}
@@ -1679,12 +1679,12 @@ func (s *Server) HandleHttpReq(w http.ResponseWriter, req *http.Request, store e
 		gz := gzip.NewWriter(&buf)
 		if _, err := gz.Write(responseBytes); err != nil {
 			s.Log.Errorf("failed to gzip response: %v%s", err, traceSuffix(ctx))
-			sendErrorResponse("failed to compress response: "+err.Error(), http.StatusInternalServerError)
+			sendErrorResponse("failed to compress response: "+err.Error(), http.StatusOK)
 			return
 		}
 		if err := gz.Close(); err != nil {
 			s.Log.Errorf("failed to finalize gzip response: %v%s", err, traceSuffix(ctx))
-			sendErrorResponse("failed to finalize compressed response: "+err.Error(), http.StatusInternalServerError)
+			sendErrorResponse("failed to finalize compressed response: "+err.Error(), http.StatusOK)
 			return
 		}
 		body = buf.Bytes()
