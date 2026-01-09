@@ -1574,17 +1574,6 @@ func (s *Server) HandleHttpReq(w http.ResponseWriter, req *http.Request, store e
 
 	wg.Wait()
 
-	if ctx.Err() != nil {
-		sendErrorResponse("request timeout", http.StatusOK)
-		return
-	}
-	for idx, err := range filterErrors {
-		if err != nil {
-			sendErrorResponse(fmt.Sprintf("query error for filter %d: %v", idx, err), http.StatusOK)
-			return
-		}
-	}
-
 	for _, events := range filterResults {
 		for _, ev := range events {
 			if len(allEvents) >= limits.MaxEvents {
