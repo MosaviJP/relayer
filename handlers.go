@@ -1417,7 +1417,7 @@ func (s *Server) HandleHttpReq(w http.ResponseWriter, req *http.Request, store e
 	
 	queryCtx, cancelQueries := context.WithCancel(ctx)
 	defer cancelQueries()
-	
+
 	// 统一的错误响应函数
 	sendErrorResponse := func(errorMsg string, httpStatus int) {
 		response := QueryResponse{
@@ -1485,6 +1485,7 @@ func (s *Server) HandleHttpReq(w http.ResponseWriter, req *http.Request, store e
 	filterElapsed := make([]time.Duration, len(filters))
 	filterDbElapsed := make([]time.Duration, len(filters))
 	filterEventCounts := make([]int, len(filters))
+	filterErrors := make([]error, len(filters))
 	var totalEventCount int64
 	requestStart := time.Now()
 
@@ -1518,6 +1519,7 @@ func (s *Server) HandleHttpReq(w http.ResponseWriter, req *http.Request, store e
 			if err != nil {
 				s.Log.Errorf("query error for filter %d: %v%s", idx, err, traceSuffix(queryCtx))
 				filterDbElapsed[idx] = dbDuration
+				filterErrors[idx] = err
 				return
 			}
 
@@ -1571,6 +1573,17 @@ func (s *Server) HandleHttpReq(w http.ResponseWriter, req *http.Request, store e
 	}
 
 	wg.Wait()
+
+	if ctx.Err() != nil {
+		sendErrorResponse("request timeout", http.StatusRequestTimeout)
+		return
+	}
+	for idx, err := range filterErrors {
+		if err != nil {
+			sendErrorResponse(fmt.Sprintf("query error for filter %d: %v", idx, err), http.StatusInternalServerError)
+			return
+		}
+	}
 
 	for _, events := range filterResults {
 		for _, ev := range events {
