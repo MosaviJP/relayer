@@ -15,6 +15,18 @@ func GetAuthStatus(ctx context.Context) (pubkey string, ok bool) {
 	return "", false
 }
 
+// GetUserAgent returns the User-Agent string stored in the context.
+func GetUserAgent(ctx context.Context) string {
+	if ctx != nil {
+		if v := ctx.Value("userAgent"); v != nil {
+			if s, ok := v.(string); ok {
+				return s
+			}
+		}
+	}
+	return ""
+}
+
 // GetConnPubkey returns a pubkey associated with this connection, preferring
 // authenticated pubkey (NIP-42). If not authenticated, it falls back to the
 // optional "pubkey" provided via request header and stored in context.

@@ -1844,6 +1844,11 @@ func (s *Server) HandleWebsocket(w http.ResponseWriter, r *http.Request) {
 		s.Log.Infof("WebSocket connection with user pubkey: %s%s", userPubkey, traceSuffix(ctx))
 	}
 
+	// 获取 User-Agent 并添加到 context
+	if userAgent := r.Header.Get("User-Agent"); userAgent != "" {
+		ctx = context.WithValue(ctx, "userAgent", userAgent)
+	}
+
 	store := s.relay.Storage(ctx)
 
 	// reader
