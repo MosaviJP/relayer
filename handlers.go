@@ -1201,7 +1201,7 @@ func (s *Server) HandleHttpReq(w http.ResponseWriter, req *http.Request, store e
     }
     
     if store == nil {
-        sendErrorResponse("no store available", http.StatusInternalServerError)
+        sendErrorResponse("no store available", http.StatusOK)
         return
     }
 
@@ -1209,7 +1209,7 @@ func (s *Server) HandleHttpReq(w http.ResponseWriter, req *http.Request, store e
         Filters []json.RawMessage `json:"filters"`
     }
     if err := json.NewDecoder(req.Body).Decode(&reqBody); err != nil {
-        sendErrorResponse("invalid request body: "+err.Error(), http.StatusBadRequest)
+        sendErrorResponse("invalid request body: "+err.Error(), http.StatusOK)
         return
     }
 
@@ -1220,7 +1220,7 @@ func (s *Server) HandleHttpReq(w http.ResponseWriter, req *http.Request, store e
     for i, filterReq := range reqBody.Filters {
         var raw map[string]json.RawMessage
         if err := json.Unmarshal(filterReq, &raw); err != nil {
-            sendErrorResponse("failed to decode filter: "+err.Error(), http.StatusBadRequest)
+            sendErrorResponse("failed to decode filter: "+err.Error(), http.StatusOK)
             return
         }
         if v, ok := raw["limit"]; ok {
@@ -1231,7 +1231,7 @@ func (s *Server) HandleHttpReq(w http.ResponseWriter, req *http.Request, store e
         }
 
         if err := json.Unmarshal(filterReq, &filters[i]); err != nil {
-            sendErrorResponse("failed to decode filter: "+err.Error(), http.StatusBadRequest)
+            sendErrorResponse("failed to decode filter: "+err.Error(), http.StatusOK)
             return
         }
     }
@@ -1345,7 +1345,7 @@ filterLoop:
     responseBytes, err := json.Marshal(response)
     if err != nil {
         s.Log.Errorf("failed to marshal response: %v", err)
-        sendErrorResponse("failed to serialize response: "+err.Error(), http.StatusInternalServerError)
+        sendErrorResponse("failed to serialize response: "+err.Error(), http.StatusOK)
         return
     }
     
@@ -1365,7 +1365,7 @@ filterLoop:
             responseBytes, err = json.Marshal(truncatedResponse)
             if err != nil {
                 s.Log.Errorf("failed to marshal truncated response: %v", err)
-                sendErrorResponse("failed to serialize truncated response: "+err.Error(), http.StatusInternalServerError)
+                sendErrorResponse("failed to serialize truncated response: "+err.Error(), http.StatusOK)
                 return
             }
             maxEvents = maxEvents / 2
@@ -1373,7 +1373,7 @@ filterLoop:
         
         if len(responseBytes) > MAX_RESPONSE_SIZE {
             s.Log.Errorf("unable to reduce response size below limit")
-            sendErrorResponse("response too large, unable to reduce size", http.StatusRequestEntityTooLarge)
+            sendErrorResponse("response too large, unable to reduce size", http.StatusOK)
             return
         }
     }
