@@ -150,6 +150,13 @@ func traceSuffix(ctx context.Context) string {
 // StartResourceMonitoring 启动简化的资源监控goroutine（导出函数供外部调用）
 func (s *Server) StartResourceMonitoring() {
 	if atomic.CompareAndSwapInt32(&monitoringStarted, 0, 1) {
+		// 周期性指标日志默认关闭，仅保留告警类输出（LEAK_WARNING / 孤儿清理）
+		// 设置 NOSTR_RESOURCE_MONITOR_LOG=verbose 可恢复完整输出
+		verbose := false
+		switch strings.ToLower(os.Getenv("NOSTR_RESOURCE_MONITOR_LOG")) {
+		case "verbose", "debug", "on", "1", "true":
+			verbose = true
+		}
 		go func() {
 			ticker := time.NewTicker(1 * time.Minute)
 			defer ticker.Stop()
@@ -212,20 +219,26 @@ func (s *Server) StartResourceMonitoring() {
 
 				// 简化的资源监控输出 - 专注于关键指标
 				// 活跃资源状态（用于检测资源泄漏）
-				log.Printf("NOSTR_RESOURCE_MONITOR active_resources goroutines=%d ws_connections=%d event_channels=%d event_envelopes=%d json_operations=%d listeners=%d, all_listeners=%d",
-					activeGoros, activeWSConns, activeChannels, activeEnvelopes, activeJSONOps, activeListenersCount, allListeners)
+				if verbose {
+					log.Printf("NOSTR_RESOURCE_MONITOR active_resources goroutines=%d ws_connections=%d event_channels=%d event_envelopes=%d json_operations=%d listeners=%d, all_listeners=%d",
+						activeGoros, activeWSConns, activeChannels, activeEnvelopes, activeJSONOps, activeListenersCount, allListeners)
+				}
 
-				// 资源泄漏检测报告（关键！）
+				// 资源泄漏检测报告（关键！告警时无条件输出）
 				leakWarning := ""
 				if consecutiveGrowth >= 3 {
 					leakWarning = " LEAK_WARNING=true"
 				}
-				log.Printf("NOSTR_RESOURCE_MONITOR leak_detection dead_connections=%d suspicious_growth=%d growth_rate=%dMB/min consecutive_growth=%d%s",
-					deadConns, suspiciousGrowth, growthRate, consecutiveGrowth, leakWarning)
+				if verbose || leakWarning != "" {
+					log.Printf("NOSTR_RESOURCE_MONITOR leak_detection dead_connections=%d suspicious_growth=%d growth_rate=%dMB/min consecutive_growth=%d%s",
+						deadConns, suspiciousGrowth, growthRate, consecutiveGrowth, leakWarning)
+				}
 
 				// 内存状态摘要
-				log.Printf("NOSTR_RESOURCE_MONITOR memory heap_alloc=%dMB heap_sys=%dMB heap_objects=%d gc_runs=%d total_goroutines=%d listeners_map_size=%d total_subscriptions=%d",
-					memStats.HeapAlloc/1024/1024, memStats.HeapSys/1024/1024, memStats.HeapObjects, memStats.NumGC, runtime.NumGoroutine(), listenersMapSize, totalListenerSubs)
+				if verbose {
+					log.Printf("NOSTR_RESOURCE_MONITOR memory heap_alloc=%dMB heap_sys=%dMB heap_objects=%d gc_runs=%d total_goroutines=%d listeners_map_size=%d total_subscriptions=%d",
+						memStats.HeapAlloc/1024/1024, memStats.HeapSys/1024/1024, memStats.HeapObjects, memStats.NumGC, runtime.NumGoroutine(), listenersMapSize, totalListenerSubs)
+				}
 
 				// ===== 新增：订阅核算（只打点，不改业务）=====
 				// 分位数（锁外计算）
@@ -254,12 +267,14 @@ func (s *Server) StartResourceMonitoring() {
 				diff := int64(totalListenerSubs) - expected
 
 				// 对账日志：恒等式是否闭合、订阅分布是否“重订阅化”
-				log.Printf("NOSTR_SUBS_ACCOUNTING subs_total_gauge=%d listeners_map_size=%d ws_connections=%d "+
-					"req_new=%d req_update=%d rem_close=%d rem_disconnect=%d rem_writefail=%d "+
-					"expected_subs=%d diff=%d subs_per_ws_p50=%d subs_per_ws_p95=%d subs_per_ws_max=%d",
-					totalListenerSubs, listenersMapSize, activeWSConns,
-					reqNew, reqUpd, remClose, remDisc, remWF,
-					expected, diff, p50, p95, pMax)
+				if verbose {
+					log.Printf("NOSTR_SUBS_ACCOUNTING subs_total_gauge=%d listeners_map_size=%d ws_connections=%d "+
+						"req_new=%d req_update=%d rem_close=%d rem_disconnect=%d rem_writefail=%d "+
+						"expected_subs=%d diff=%d subs_per_ws_p50=%d subs_per_ws_p95=%d subs_per_ws_max=%d",
+						totalListenerSubs, listenersMapSize, activeWSConns,
+						reqNew, reqUpd, remClose, remDisc, remWF,
+						expected, diff, p50, p95, pMax)
+				}
 				// —— Orphan 订阅检测（只打日志，不改逻辑）——
 
 				// 1) 建立当前活跃底层连接集合（基于 s.clients）
@@ -293,11 +308,13 @@ func (s *Server) StartResourceMonitoring() {
 					avgSubsPerWS = float64(subTotal) / float64(lmSize)
 				}
 
-				// 3) 打一行独立日志，用于定位“孤儿订阅”
-				log.Printf("NOSTR_ORPHANS listeners_map_size=%d ws_clients=%d ws_connections_counter=%d "+
-					"orphans_ws=%d orphan_subs=%d avg_subs_per_ws=%.2f",
-					lmSize, wsClients, atomic.LoadInt64(&activeWebSocketConnections),
-					orphanWS, orphanSubs, avgSubsPerWS)
+				// 3) 打一行独立日志，用于定位“孤儿订阅”（发现孤儿时无条件输出）
+				if verbose || orphanWS > 0 {
+					log.Printf("NOSTR_ORPHANS listeners_map_size=%d ws_clients=%d ws_connections_counter=%d "+
+						"orphans_ws=%d orphan_subs=%d avg_subs_per_ws=%.2f",
+						lmSize, wsClients, atomic.LoadInt64(&activeWebSocketConnections),
+						orphanWS, orphanSubs, avgSubsPerWS)
+				}
 
 				// 可选：受控清孤儿（把历史存量清掉，方便观察新的竞态是否还发生）
 				if orphanWS > 0 {
