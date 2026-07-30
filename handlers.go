@@ -65,6 +65,18 @@ var (
 	monitoringStarted int32 // 确保监控只启动一次
 )
 
+// diagLogVerbose controls diagnostic logging: periodic resource metrics and
+// connection/subscription lifecycle traces. Off by default; set
+// NOSTR_RESOURCE_MONITOR_LOG=verbose to enable. Alert output (LEAK_WARNING,
+// orphan cleanup) is not affected by this switch.
+var diagLogVerbose = func() bool {
+	switch strings.ToLower(os.Getenv("NOSTR_RESOURCE_MONITOR_LOG")) {
+	case "verbose", "debug", "on", "1", "true":
+		return true
+	}
+	return false
+}()
+
 func traceIDFromContext(ctx context.Context) string {
 	if ctx == nil {
 		return ""
@@ -150,13 +162,7 @@ func traceSuffix(ctx context.Context) string {
 // StartResourceMonitoring 启动简化的资源监控goroutine（导出函数供外部调用）
 func (s *Server) StartResourceMonitoring() {
 	if atomic.CompareAndSwapInt32(&monitoringStarted, 0, 1) {
-		// 周期性指标日志默认关闭，仅保留告警类输出（LEAK_WARNING / 孤儿清理）
-		// 设置 NOSTR_RESOURCE_MONITOR_LOG=verbose 可恢复完整输出
-		verbose := false
-		switch strings.ToLower(os.Getenv("NOSTR_RESOURCE_MONITOR_LOG")) {
-		case "verbose", "debug", "on", "1", "true":
-			verbose = true
-		}
+		verbose := diagLogVerbose
 		go func() {
 			ticker := time.NewTicker(1 * time.Minute)
 			defer ticker.Stop()
@@ -224,7 +230,7 @@ func (s *Server) StartResourceMonitoring() {
 						activeGoros, activeWSConns, activeChannels, activeEnvelopes, activeJSONOps, activeListenersCount, allListeners)
 				}
 
-				// 资源泄漏检测报告（关键！告警时无条件输出）
+				// Leak detection report: always printed when LEAK_WARNING fires
 				leakWarning := ""
 				if consecutiveGrowth >= 3 {
 					leakWarning = " LEAK_WARNING=true"
@@ -1132,7 +1138,9 @@ func (s *Server) doReq(ctx context.Context, ws *WebSocket, request []json.RawMes
 					listenersMutex.Lock()
 					if _, ok := closingWS[ws]; !ok {
 						closingWS[ws] = struct{}{}
-						fmt.Printf("NOSTR_WS_MARK_CLOSING ws=%p conn=%p reason=history_write_err:%v%s\n", ws, ws.conn, err, traceSuffix(ctx))
+						if diagLogVerbose {
+							fmt.Printf("NOSTR_WS_MARK_CLOSING ws=%p conn=%p reason=history_write_err:%v%s\n", ws, ws.conn, err, traceSuffix(ctx))
+						}
 					}
 					listenersMutex.Unlock()
 
@@ -1209,7 +1217,9 @@ func (s *Server) doReq(ctx context.Context, ws *WebSocket, request []json.RawMes
 		listenersMutex.Lock()
 		if _, ok := closingWS[ws]; !ok {
 			closingWS[ws] = struct{}{}
-			fmt.Printf("NOSTR_WS_MARK_CLOSING ws=%p conn=%p reason=eose_write_err:%v%s\n", ws, ws.conn, err, traceSuffix(ctx))
+			if diagLogVerbose {
+				fmt.Printf("NOSTR_WS_MARK_CLOSING ws=%p conn=%p reason=eose_write_err:%v%s\n", ws, ws.conn, err, traceSuffix(ctx))
+			}
 		}
 		listenersMutex.Unlock()
 		return ""
@@ -1839,7 +1849,9 @@ func (s *Server) HandleWebsocket(w http.ResponseWriter, r *http.Request) {
 	s.Log.Infof("connected from %s%s", ip, traceLogSuffix)
 
 	ws := challenge(conn)
-	fmt.Printf("NOSTR_WS_OPEN ws=%p conn=%p, ip=%s%s\n", ws, conn, ip, traceLogSuffix)
+	if diagLogVerbose {
+		fmt.Printf("NOSTR_WS_OPEN ws=%p conn=%p, ip=%s%s\n", ws, conn, ip, traceLogSuffix)
+	}
 
 	if s.options.perConnectionLimiter != nil {
 		ws.limiter = rate.NewLimiter(
@@ -1907,7 +1919,9 @@ func (s *Server) HandleWebsocket(w http.ResponseWriter, r *http.Request) {
 				listenersMutex.Lock()
 				if _, ok := closingWS[ws]; !ok {
 					closingWS[ws] = struct{}{}
-					fmt.Printf("NOSTR_WS_MARK_CLOSING ws=%p conn=%p reason=read_err:%v%s\n", ws, conn, err, traceSuffix(ctx))
+					if diagLogVerbose {
+						fmt.Printf("NOSTR_WS_MARK_CLOSING ws=%p conn=%p reason=read_err:%v%s\n", ws, conn, err, traceSuffix(ctx))
+					}
 				}
 				listenersMutex.Unlock()
 				if websocket.IsUnexpectedCloseError(
@@ -1968,7 +1982,9 @@ func (s *Server) HandleWebsocket(w http.ResponseWriter, r *http.Request) {
 					listenersMutex.Lock()
 					if _, ok := closingWS[ws]; !ok {
 						closingWS[ws] = struct{}{}
-						fmt.Printf("NOSTR_WS_MARK_CLOSING ws=%p conn=%p reason=ping_write_err:%v%s\n", ws, conn, err, traceSuffix(ctx))
+						if diagLogVerbose {
+							fmt.Printf("NOSTR_WS_MARK_CLOSING ws=%p conn=%p reason=ping_write_err:%v%s\n", ws, conn, err, traceSuffix(ctx))
+						}
 					}
 					listenersMutex.Unlock()
 					s.Log.Errorf("error writing ping: %v; closing websocket%s", err, traceSuffix(ctx))
